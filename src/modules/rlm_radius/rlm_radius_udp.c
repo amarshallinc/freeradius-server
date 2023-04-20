@@ -756,7 +756,8 @@ static fr_connection_state_t conn_init(void **h_out, fr_connection_t *conn, void
 	/*
 	 *	Open the outgoing socket.
 	 */
-	fd = fr_socket_client_udp(&h->src_ipaddr, &h->src_port, &h->inst->dst_ipaddr, h->inst->dst_port, true);
+	fd = fr_socket_client_udp(h->inst->interface, &h->src_ipaddr, &h->src_port,
+				  &h->inst->dst_ipaddr, h->inst->dst_port, true);
 	if (fd < 0) {
 		PERROR("%s - Failed opening socket", h->module_name);
 	fail:
@@ -1577,7 +1578,6 @@ static bool check_for_zombie(fr_event_list_t *el, fr_trunk_connection_t *tconn, 
 
 	/*
 	 *	If we're status checking OR already zombie, don't go to zombie
-	 *
 	 */
 	if (h->status_checking || h->zombie_ev) return true;
 
@@ -1594,13 +1594,7 @@ static bool check_for_zombie(fr_event_list_t *el, fr_trunk_connection_t *tconn, 
 	if (h->inst->parent->synchronous && fr_time_gt(last_sent, fr_time_wrap(0)) &&
 	    (fr_time_lt(fr_time_add(last_sent, h->inst->parent->response_window), now))) return false;
 
-	/*
-	 *	Mark the connection as inactive, but keep sending
-	 *	packets on it.
-	 */
 	WARN("%s - Entering Zombie state - connection %s", h->module_name, h->name);
-	fr_trunk_connection_signal_inactive(tconn);
-
 	if (h->inst->parent->status_check) {
 		h->status_checking = true;
 
@@ -1760,12 +1754,6 @@ static void request_mux(fr_event_list_t *el,
 	int			sent;
 	uint16_t		i, queued;
 	size_t			total_len = 0;
-
-	/*
-	 *	If the connection is zombie, then don't try to enqueue
-	 *	things on it!
-	 */
-	if (check_for_zombie(el, tconn, fr_time_wrap(0), h->last_sent)) return;
 
 	/*
 	 *	Encode multiple packets in preparation
@@ -2777,6 +2765,7 @@ static unlang_action_t mod_enqueue(rlm_rcode_t *p_result, void **rctx_out, void 
 	 */
 	if (q == FR_TRUNK_ENQUEUE_IN_BACKLOG) {
 		RDEBUG("All destinations are down - cannot send packet");
+		fr_trunk_request_signal_cancel(treq);
 		goto fail;
 	}
 

@@ -267,6 +267,8 @@ static void _ldap_sasl_bind_io_write(fr_event_list_t *el, int fd, UNUSED int fla
 	 *	We're done, woohoo!
 	 */
 	case LDAP_SUCCESS:
+		DEBUG2("SASL bind as \"%s\" to \"%s\" successful",
+		       sasl_ctx->identity ? sasl_ctx->identity : "(anonymous)", c->config->server);
 		talloc_free(sasl_ctx);
 		fr_ldap_state_next(c);
 		break;
@@ -372,13 +374,14 @@ static unlang_action_t ldap_async_sasl_auth_bind_start(UNUSED rlm_rcode_t *p_res
 
 	RDEBUG2("%s SASL bind auth operation as %s", sasl_ctx->rmech ? "Continuing" : "Starting", sasl_ctx->dn);
 
-	ret = ldap_sasl_interactive_bind(sasl_ctx->c->handle, sasl_ctx->dn, sasl_ctx->mechs,
+	ret = ldap_sasl_interactive_bind(sasl_ctx->c->handle, NULL, sasl_ctx->mechs,
 					 NULL, NULL, LDAP_SASL_AUTOMATIC,
 					 _sasl_interact, sasl_ctx, sasl_ctx->result,
 					 &sasl_ctx->rmech, &bind_auth_ctx->msgid);
 
 	switch (ret) {
 	case LDAP_SUCCESS:
+		bind_auth_ctx->ret = LDAP_PROC_SUCCESS;
 		return UNLANG_ACTION_CALCULATE_RESULT;
 
 	case LDAP_SASL_BIND_IN_PROGRESS:
@@ -418,7 +421,7 @@ static unlang_action_t ldap_async_sasl_auth_bind_results(rlm_rcode_t *p_result, 
 {
 	fr_ldap_bind_auth_ctx_t	*bind_auth_ctx = talloc_get_type_abort(uctx, fr_ldap_bind_auth_ctx_t);
 	fr_ldap_sasl_ctx_t	*sasl_ctx = bind_auth_ctx->sasl_ctx;
-	fr_ldap_result_code_t	ret = bind_auth_ctx->ret;
+	fr_ldap_rcode_t		ret = bind_auth_ctx->ret;
 
 	switch (bind_auth_ctx->ret) {
 	case LDAP_PROC_SUCCESS:
@@ -503,7 +506,7 @@ int fr_ldap_sasl_bind_auth_async(request_t *request, fr_ldap_thread_t *thread, c
 	};
 	bind_auth_ctx->request = request;
 	bind_auth_ctx->thread = thread;
-	bind_auth_ctx->ret = LDAP_RESULT_PENDING;
+	bind_auth_ctx->ret = LDAP_PROC_NO_RESULT;
 	bind_auth_ctx->type = LDAP_BIND_SASL;
 
 	return unlang_function_push(request, ldap_async_sasl_auth_bind_start, ldap_async_sasl_auth_bind_results,

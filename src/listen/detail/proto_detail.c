@@ -64,6 +64,8 @@ static CONF_PARSER const proto_detail_config[] = {
 	{ FR_CONF_OFFSET("max_packet_size", FR_TYPE_UINT32, proto_detail_t, max_packet_size) } ,
 	{ FR_CONF_OFFSET("num_messages", FR_TYPE_UINT32, proto_detail_t, num_messages) } ,
 
+	{ FR_CONF_OFFSET("exit_when_done", FR_TYPE_BOOL, proto_detail_t, exit_when_done) },
+
 	{ FR_CONF_OFFSET("priority", FR_TYPE_UINT32, proto_detail_t, priority) },
 
 	CONF_PARSER_TERMINATOR
@@ -476,7 +478,7 @@ static int mod_instantiate(module_inst_ctx_t const *mctx)
 	 */
 	if (strcmp(inst->io_submodule->module->dl->name, "proto_detail_work") != 0) {
 		if (inst->work_io->common.instantiate &&
-		    (inst->work_io->common.instantiate(MODULE_INST_CTX(inst->io_submodule)) < 0)) {
+		    (inst->work_io->common.instantiate(MODULE_INST_CTX(inst->work_submodule)) < 0)) {
 			cf_log_err(inst->work_io_conf, "Instantiation failed for \"%s\"", inst->work_io->common.name);
 			return -1;
 		}

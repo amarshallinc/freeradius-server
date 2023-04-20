@@ -933,7 +933,7 @@ static int send_one_packet(rc_request_t *request)
 			int mysockfd;
 
 			if (ipproto == IPPROTO_TCP) {
-				mysockfd = fr_socket_client_tcp(NULL,
+				mysockfd = fr_socket_client_tcp(NULL, NULL,
 								&request->packet->socket.inet.dst_ipaddr,
 								request->packet->socket.inet.dst_port, false);
 				if (mysockfd < 0) {
@@ -949,7 +949,7 @@ static int send_one_packet(rc_request_t *request)
 					return -1;
 				}
 
-				if (fr_socket_bind(mysockfd, &client_ipaddr, &port, NULL) < 0) {
+				if (fr_socket_bind(mysockfd, NULL, &client_ipaddr, &port) < 0) {
 					fr_perror("Error binding socket");
 					return -1;
 				}
@@ -1774,7 +1774,7 @@ int main(int argc, char **argv)
 	if (client_port == 0) client_port = request->packet->socket.inet.src_port;
 
 	if (ipproto == IPPROTO_TCP) {
-		sockfd = fr_socket_client_tcp(NULL, &server_ipaddr, server_port, false);
+		sockfd = fr_socket_client_tcp(NULL, NULL, &server_ipaddr, server_port, false);
 		if (sockfd < 0) {
 			ERROR("Failed opening socket");
 			return -1;
@@ -1787,7 +1787,7 @@ int main(int argc, char **argv)
 			return -1;
 		}
 
-		if (fr_socket_bind(sockfd, &client_ipaddr, &client_port, NULL) < 0) {
+		if (fr_socket_bind(sockfd, NULL, &client_ipaddr, &client_port) < 0) {
 			fr_perror("Error binding socket");
 			return -1;
 		}
@@ -1800,7 +1800,7 @@ int main(int argc, char **argv)
 			return -1;
 		}
 
-		if (fr_socket_bind(coafd, &client_ipaddr, &coa_port, NULL) < 0) {
+		if (fr_socket_bind(coafd, NULL, &client_ipaddr, &coa_port) < 0) {
 			fr_perror("Error binding socket");
 			return -1;
 		}

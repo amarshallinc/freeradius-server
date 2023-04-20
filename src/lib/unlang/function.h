@@ -70,8 +70,8 @@ int		unlang_function_clear(request_t *request) CC_HINT(warn_unused_result);
  *	- 0 on success.
  *      - -1 on failure.
  */
-#define		unlang_function_signal_set(_request, _signal) \
-		_unlang_function_signal_set(_request, _signal, STRINGIFY(_signal))
+#define		unlang_function_signal_set(_request, _signal, _sigmask) \
+		_unlang_function_signal_set(_request, _signal, _sigmask, STRINGIFY(_signal))
 int		_unlang_function_signal_set(request_t *request, unlang_function_signal_t signal, fr_signal_t sigmask, char const *name)
 		CC_HINT(warn_unused_result);
 
@@ -104,8 +104,8 @@ int		_unlang_function_repeat_set(request_t *request, unlang_function_t repeat, c
  * @param[in] _top_frame	Return out of the unlang interpreter when popping this frame.
  * @param[in] _uctx		to pass to func(s).
  * @return
- *	- 0 on success.
- *	- -1 on failure.
+ *	- UNLANG_ACTION_PUSHED_CHILD on success.
+ *	- UNLANG_ACTION_FAIL on failure.
  */
 #define		unlang_function_push(_request, _func, _repeat, _signal, _sigmask, _top_frame, _uctx) \
 		_unlang_function_push(_request, \

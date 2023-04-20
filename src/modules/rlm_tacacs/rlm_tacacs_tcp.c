@@ -282,7 +282,7 @@ static fr_connection_state_t conn_init(void **h_out, fr_connection_t *conn, void
 	/*
 	 *	Open the outgoing socket.
 	 */
-	fd = fr_socket_client_tcp(&h->src_ipaddr, &h->inst->dst_ipaddr, h->inst->dst_port, true);
+	fd = fr_socket_client_tcp(NULL, &h->src_ipaddr, &h->inst->dst_ipaddr, h->inst->dst_port, true);
 	if (fd < 0) {
 		PERROR("%s - Failed opening socket", h->module_name);
 		talloc_free(h);
@@ -797,12 +797,6 @@ static void request_mux(fr_event_list_t *el,
 	uint16_t		i, queued;
 	uint8_t const		*written;
 	uint8_t			*partial;
-
-	/*
-	 *	If the connection is zombie, then don't try to enqueue
-	 *	things on it!
-	 */
-	if (check_for_zombie(el, tconn, fr_time_wrap(0), h->last_sent)) return;
 
 	/*
 	 *	Encode multiple packets in preparation for transmission with write()

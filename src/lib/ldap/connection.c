@@ -192,9 +192,9 @@ static void _ldap_connection_close(fr_event_list_t *el, void *h, UNUSED void *uc
 	fr_ldap_connection_t *c = talloc_get_type_abort(h, fr_ldap_connection_t);
 
 	/*
-	 *	Explicitly remove the file descriptor
+	 *	Explicitly remove the file descriptor event
 	 *
-	 *	Event if the fr_ldap_connection_t has outstanding
+	 *	Even if the fr_ldap_connection_t has outstanding
 	 *	queries, we still don't want its fd in the event loop.
 	 */
 	if (c->fd >= 0) {
@@ -546,7 +546,7 @@ static void ldap_conn_error(UNUSED fr_event_list_t *el, UNUSED int fd, UNUSED in
 {
 	fr_trunk_connection_t	*tconn = talloc_get_type_abort(uctx, fr_trunk_connection_t);
 
-	ERROR("rlm_ldap - Connection failed: %s", fr_syserror(fd_errno));
+	ERROR("%s - Connection failed: %s", tconn->conn->name, fr_syserror(fd_errno));
 
 	fr_connection_signal_reconnect(tconn->conn, FR_CONNECTION_FAILED);
 }
