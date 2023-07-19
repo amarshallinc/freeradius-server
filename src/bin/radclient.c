@@ -34,6 +34,9 @@ RCSID("$Id$")
 #include <freeradius-devel/util/time.h>
 #include <freeradius-devel/radius/list.h>
 #include <freeradius-devel/radius/radius.h>
+#ifdef HAVE_OPENSSL_SSL_H
+#include <openssl/ssl.h>
+#endif
 #include <ctype.h>
 
 #ifdef HAVE_GETOPT_H
@@ -49,7 +52,14 @@ typedef struct request_s request_t;	/* to shut up warnings about mschap.h */
 
 #include "radclient.h"
 
-#define pair_update_request(_attr, _da) fr_pair_update_by_da(request, _attr, &request->request_pairs, _da, 0)
+#define pair_update_request(_attr, _da) do { \
+		_attr = fr_pair_find_by_da(&request->request_pairs, NULL, _da); \
+		if (!_attr) { \
+			_attr = fr_pair_afrom_da(request, _da); \
+			assert(_attr != NULL); \
+			fr_pair_append(&request->request_pairs, _attr); \
+		} \
+	} while (0)
 #define request_pairs	request_list
 #define reply_pairs	reply_list
 
@@ -156,29 +166,29 @@ static NEVER_RETURNS void usage(void)
 {
 	fprintf(stderr, "Usage: radclient [options] server[:port] <command> [<secret>]\n");
 
-	fprintf(stderr, "  <command>              One of auth, acct, status, coa, disconnect or auto.\n");
-	fprintf(stderr, "  -4                     Use IPv4 address of server\n");
-	fprintf(stderr, "  -6                     Use IPv6 address of server.\n");
-	fprintf(stderr, "  -A <attribute>         Use named 'attribute' to match CoA requests to packets.  Default is User-Name\n");
-	fprintf(stderr, "  -C <client_port>       Assigning port number to client socket. Values may be 1..65535\n");
-	fprintf(stderr, "  -c <count>             Send each packet 'count' times.\n");
-	fprintf(stderr, "  -d <raddb>             Set user dictionary directory (defaults to " RADDBDIR ").\n");
-	fprintf(stderr, "  -D <dictdir>           Set main dictionary directory (defaults to " DICTDIR ").\n");
-	fprintf(stderr, "  -f <file>[:<file>]     Read packets from file, not stdin.\n");
-	fprintf(stderr, "                         If a second file is provided, it will be used to verify responses\n");
-	fprintf(stderr, "  -F                     Print the file name, packet number and reply code.\n");
-	fprintf(stderr, "  -h                     Print usage help information.\n");
-	fprintf(stderr, "  -i <id>                Set request id to 'id'.  Values may be 0..255\n");
-	fprintf(stderr, "  -n <num>               Send N requests/s\n");
-	fprintf(stderr, "  -o <port>              Set CoA port (defaults to 3799)\n");
-	fprintf(stderr, "  -p <num>               Send 'num' packets from a file in parallel.\n");
-	fprintf(stderr, "  -P <proto>             Use proto (tcp or udp) for transport.\n");
-	fprintf(stderr, "  -r <retries>           If timeout, retry sending the packet 'retries' times.\n");
-	fprintf(stderr, "  -s                     Print out summary information of auth results.\n");
-	fprintf(stderr, "  -S <file>              read secret from file, not command line.\n");
-	fprintf(stderr, "  -t <timeout>           Wait 'timeout' seconds before retrying (may be a floating point number).\n");
-	fprintf(stderr, "  -v                     Show program version information.\n");
-	fprintf(stderr, "  -x                     Debugging mode.\n");
+	fprintf(stderr, "  <command>                         One of auth, acct, status, coa, disconnect or auto.\n");
+	fprintf(stderr, "  -4                                Use IPv4 address of server\n");
+	fprintf(stderr, "  -6                                Use IPv6 address of server.\n");
+	fprintf(stderr, "  -A <attribute>		     Use named 'attribute' to match CoA requests to packets.  Default is User-Name\n");
+	fprintf(stderr, "  -C [<client_ip>:]<client_port>    Client source port and source IP address.  Port values may be 1..65535\n");
+	fprintf(stderr, "  -c <count>			     Send each packet 'count' times.\n");
+	fprintf(stderr, "  -d <raddb>                        Set user dictionary directory (defaults to " RADDBDIR ").\n");
+	fprintf(stderr, "  -D <dictdir>                      Set main dictionary directory (defaults to " DICTDIR ").\n");
+	fprintf(stderr, "  -f <file>[:<file>]                Read packets from file, not stdin.\n");
+	fprintf(stderr, "                                    If a second file is provided, it will be used to verify responses\n");
+	fprintf(stderr, "  -F                                Print the file name, packet number and reply code.\n");
+	fprintf(stderr, "  -h                                Print usage help information.\n");
+	fprintf(stderr, "  -i <id>                           Set request id to 'id'.  Values may be 0..255\n");
+	fprintf(stderr, "  -n <num>                          Send N requests/s\n");
+	fprintf(stderr, "  -o <port>                         Set CoA listening port (defaults to 3799)\n");
+	fprintf(stderr, "  -p <num>                          Send 'num' packets from a file in parallel.\n");
+	fprintf(stderr, "  -P <proto>                        Use proto (tcp or udp) for transport.\n");
+	fprintf(stderr, "  -r <retries>                      If timeout, retry sending the packet 'retries' times.\n");
+	fprintf(stderr, "  -s                                Print out summary information of auth results.\n");
+	fprintf(stderr, "  -S <file>                         read secret from file, not command line.\n");
+	fprintf(stderr, "  -t <timeout>                      Wait 'timeout' seconds before retrying (may be a floating point number).\n");
+	fprintf(stderr, "  -v                                Show program version information.\n");
+	fprintf(stderr, "  -x                                Debugging mode.\n");
 
 	fr_exit_now(EXIT_SUCCESS);
 }
@@ -195,6 +205,54 @@ static int _rc_request_free(rc_request_t *request)
 
 	return 0;
 }
+
+#if defined(OPENSSL_VERSION_NUMBER) && OPENSSL_VERSION_NUMBER >= 0x30000000L
+#  include <openssl/provider.h>
+
+static OSSL_PROVIDER *openssl_default_provider = NULL;
+static OSSL_PROVIDER *openssl_legacy_provider = NULL;
+
+static int openssl3_init(void)
+{
+	/*
+	 *	Load the default provider for most algorithms
+	 */
+	openssl_default_provider = OSSL_PROVIDER_load(NULL, "default");
+	if (!openssl_default_provider) {
+		ERROR("(TLS) Failed loading default provider");
+		return -1;
+	}
+
+	/*
+	 *	Needed for MD4
+	 *
+	 *	https://www.openssl.org/docs/man3.0/man7/migration_guide.html#Legacy-Algorithms
+	 */
+	openssl_legacy_provider = OSSL_PROVIDER_load(NULL, "legacy");
+	if (!openssl_legacy_provider) {
+		ERROR("(TLS) Failed loading legacy provider");
+		return -1;
+	}
+
+	return 0;
+}
+
+static void openssl3_free(void)
+{
+	if (openssl_default_provider && !OSSL_PROVIDER_unload(openssl_default_provider)) {
+		ERROR("Failed unloading default provider");
+	}
+	openssl_default_provider = NULL;
+
+	if (openssl_legacy_provider && !OSSL_PROVIDER_unload(openssl_legacy_provider)) {
+		ERROR("Failed unloading legacy provider");
+	}
+	openssl_legacy_provider = NULL;
+}
+#else
+#define openssl3_init()
+#define openssl3_free()
+#endif
 
 static int mschapv1_encode(fr_radius_packet_t *packet, fr_pair_list_t *list,
 			   char const *password)
@@ -618,11 +676,11 @@ static int radclient_init(TALLOC_CTX *ctx, rc_file_pair_t *files)
 				/*
 				 *	CHAP-Password is octets, so it may not be zero terminated.
 				 */
-				MEM(pair_update_request(&request->password, attr_cleartext_password) >= 0);
+				pair_update_request(request->password, attr_cleartext_password);
 				fr_pair_value_bstrndup(request->password, vp->vp_strvalue, vp->vp_length, true);
 			} else if ((vp->da == attr_user_password) ||
 				   (vp->da == attr_ms_chap_password)) {
-				MEM(pair_update_request(&request->password, attr_cleartext_password) >= 0);
+				pair_update_request(request->password, attr_cleartext_password);
 				fr_pair_value_bstrndup(request->password, vp->vp_strvalue, vp->vp_length, true);
 
 			} else if (vp->da == attr_radclient_test_name) {
@@ -999,7 +1057,7 @@ static int send_one_packet(rc_request_t *request)
 							       request->password->vp_length);
 				fr_pair_value_memdup(vp, buffer, sizeof(buffer), false);
 
-			} else if (fr_pair_find_by_da(&request->request_pairs, NULL, attr_ms_chap_password) != NULL) {
+			} else if (fr_pair_find_by_da_nested(&request->request_pairs, NULL, attr_ms_chap_password) != NULL) {
 				mschapv1_encode(request->packet, &request->request_pairs, request->password->vp_strvalue);
 
 			} else {
@@ -1478,6 +1536,15 @@ int main(int argc, char **argv)
 		{
 			int tmp;
 
+			if (strchr(optarg, ':')) {
+				if (fr_inet_pton_port(&client_ipaddr, &client_port,
+						      optarg, -1, AF_UNSPEC, true, false) < 0) {
+					fr_perror("Failed parsing source address");
+					fr_exit_now(1);
+				}
+				break;
+			}
+
 			tmp = atoi(optarg);
 			if (tmp < 1 || tmp > 65535) usage();
 
@@ -1759,16 +1826,21 @@ int main(int argc, char **argv)
 		fr_exit_now(1);
 	}
 
+	openssl3_init();
+
 	/*
 	 *	Bind to the first specified IP address and port.
 	 *	This means we ignore later ones.
 	 */
 	request = fr_dlist_head(&rc_request_list);
-	if (request->packet->socket.inet.src_ipaddr.af == AF_UNSPEC) {
-		memset(&client_ipaddr, 0, sizeof(client_ipaddr));
-		client_ipaddr.af = server_ipaddr.af;
-	} else {
-		client_ipaddr = request->packet->socket.inet.src_ipaddr;
+
+	if (client_ipaddr.af == AF_UNSPEC) {
+		if (request->packet->socket.inet.src_ipaddr.af == AF_UNSPEC) {
+			memset(&client_ipaddr, 0, sizeof(client_ipaddr));
+			client_ipaddr.af = server_ipaddr.af;
+		} else {
+			client_ipaddr = request->packet->socket.inet.src_ipaddr;
+		}
 	}
 
 	if (client_port == 0) client_port = request->packet->socket.inet.src_port;
@@ -2031,6 +2103,8 @@ int main(int argc, char **argv)
 	fr_atexit_global_trigger_all();
 
 	if ((stats.lost > 0) || (stats.failed > 0)) return EXIT_FAILURE;
+
+	openssl3_free();
 
 	return ret;
 }

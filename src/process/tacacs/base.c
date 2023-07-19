@@ -71,6 +71,7 @@ static fr_dict_attr_t const *attr_tacacs_server_message;
 static fr_dict_attr_t const *attr_tacacs_session_id;
 static fr_dict_attr_t const *attr_tacacs_sequence_number;
 static fr_dict_attr_t const *attr_tacacs_state;
+static fr_dict_attr_t const *attr_tacacs_user_message;
 
 static fr_dict_attr_t const *attr_user_name;
 static fr_dict_attr_t const *attr_user_password;
@@ -104,6 +105,7 @@ fr_dict_attr_autoload_t process_tacacs_dict_attr[] = {
 	{ .out = &attr_tacacs_sequence_number, .name = "Packet.Sequence-Number", .type = FR_TYPE_UINT8, .dict = &dict_tacacs },
 	{ .out = &attr_tacacs_server_message, .name = "Server-Message", .type = FR_TYPE_STRING, .dict = &dict_tacacs },
 	{ .out = &attr_tacacs_state, .name = "State", .type = FR_TYPE_OCTETS, .dict = &dict_tacacs },
+	{ .out = &attr_tacacs_user_message, .name = "User-Message", .type = FR_TYPE_STRING, .dict = &dict_tacacs },
 
 	{ .out = &attr_user_name, .name = "User-Name", .type = FR_TYPE_STRING, .dict = &dict_tacacs },
 	{ .out = &attr_user_password, .name = "User-Password", .type = FR_TYPE_STRING, .dict = &dict_tacacs },
@@ -114,11 +116,13 @@ fr_dict_attr_autoload_t process_tacacs_dict_attr[] = {
 
 static fr_value_box_t const	*enum_auth_type_accept;
 static fr_value_box_t const	*enum_auth_type_reject;
+static fr_value_box_t const	*enum_tacacs_auth_type_ascii;
 
 extern fr_dict_enum_autoload_t process_tacacs_dict_enum[];
 fr_dict_enum_autoload_t process_tacacs_dict_enum[] = {
 	{ .out = &enum_auth_type_accept, .name = "Accept", .attr = &attr_auth_type },
 	{ .out = &enum_auth_type_reject, .name = "Reject", .attr = &attr_auth_type },
+	{ .out = &enum_tacacs_auth_type_ascii, .name = "ASCII", .attr = &attr_tacacs_authentication_type },
 	{ NULL }
 };
 
@@ -358,12 +362,12 @@ static int state_create(TALLOC_CTX *ctx, fr_pair_list_t *out, request_t *request
 	uint32_t	hash;
 	fr_pair_t 	*vp;
 
-	vp = fr_pair_find_by_da(&request->request_pairs, NULL, attr_tacacs_session_id);
+	vp = fr_pair_find_by_da_nested(&request->request_pairs, NULL, attr_tacacs_session_id);
 	if (!vp) return -1;
 
 	fr_nbo_from_uint32(buffer, vp->vp_uint32);
 
-	vp = fr_pair_find_by_da(&request->request_pairs, NULL, attr_tacacs_sequence_number);
+	vp = fr_pair_find_by_da_nested(&request->request_pairs, NULL, attr_tacacs_sequence_number);
 	if (!vp) return -1;
 
 	/*
@@ -431,7 +435,7 @@ static uint32_t reply_code(request_t *request, fr_dict_attr_t const *status_da,
 	vp = fr_pair_find_by_da(&request->reply_pairs, NULL, status_da);
 	if (vp) {
 		code = status2code[vp->vp_uint8];
-		if (code > 0) {
+		if (FR_TACACS_PACKET_CODE_VALID(code)) {
 			RDEBUG("Setting reply Packet-Type from %pP", vp);
 			return code;
 		}
@@ -440,12 +444,12 @@ static uint32_t reply_code(request_t *request, fr_dict_attr_t const *status_da,
 
 	if (state) {
 		code = state->packet_type[rcode];
-		if (code > 0) return code;
+		if (FR_TACACS_PACKET_CODE_VALID(code)) return code;
 	}
 
 	if (process_rcode) {
 		code = process_rcode[rcode];
-		if (code) return code;
+		if (FR_TACACS_PACKET_CODE_VALID(code)) return code;
 	}
 
 	/*
@@ -557,16 +561,16 @@ RESUME(auth_start)
 			 *	We only do multi-round authentication for the ASCII authentication type.
 			 *	Other authentication types are defined to be one request/reply only.
 			 */
+			vp = fr_pair_find_by_da(&request->request_pairs, NULL, attr_tacacs_authentication_type);
 			if (!packet_is_authen_start_request(packet) ||
-			    (packet->authen_start.authen_type != FR_AUTHENTICATION_TYPE_VALUE_ASCII)) {
+			    (vp && (fr_value_box_cmp(&vp->data, enum_tacacs_auth_type_ascii) != 0))) {
 				goto auth_type;
 			}
 
 			vp = fr_pair_find_by_da(&request->request_pairs, NULL, attr_user_name);
-			if (vp && vp->vp_length == 0) {
+			if (!vp) {
 				RDEBUG("No User-Name, replying with Authentication-GetUser");
 				request->reply->code = FR_TACACS_CODE_AUTH_GETUSER;
-
 			} else {
 				RDEBUG("User-Name = %pV, replying with Authentication-GetPass", &vp->data);
 				request->reply->code = FR_TACACS_CODE_AUTH_GETPASS;
@@ -578,7 +582,7 @@ RESUME(auth_start)
 		/*
 		 *	Last reply was "get username", we now get the password.
 		 */
-		if (session->reply == FR_TAC_PLUS_AUTHEN_STATUS_GETUSER) {
+		if (session->reply == FR_TACACS_CODE_AUTH_GETUSER) {
 			RDEBUG("No User-Password, replying with Authentication-GetPass");
 			request->reply->code = FR_TACACS_CODE_AUTH_GETPASS;
 			goto send_reply;
@@ -745,7 +749,7 @@ RESUME(auth_type)
 	return state->send(p_result, mctx, request);
 }
 
-RESUME_NO_RCTX(auth_pass)
+RESUME(auth_pass)
 {
 	fr_pair_t			*vp;
 	process_tacacs_t const		*inst = talloc_get_type_abort_const(mctx->inst->data, process_tacacs_t);
@@ -765,7 +769,7 @@ RESUME_NO_RCTX(auth_pass)
 	RETURN_MODULE_OK;
 }
 
-RESUME_NO_RCTX(auth_fail)
+RESUME(auth_fail)
 {
 	fr_pair_t			*vp;
 	process_tacacs_t const		*inst = talloc_get_type_abort_const(mctx->inst->data, process_tacacs_t);
@@ -786,7 +790,7 @@ RESUME_NO_RCTX(auth_fail)
 	RETURN_MODULE_OK;
 }
 
-RESUME_NO_RCTX(auth_restart)
+RESUME(auth_restart)
 {
 	process_tacacs_t const		*inst = talloc_get_type_abort_const(mctx->inst->data, process_tacacs_t);
 
@@ -800,6 +804,7 @@ RESUME(auth_get)
 {
 	process_tacacs_t const		*inst = talloc_get_type_abort_const(mctx->inst->data, process_tacacs_t);
 	process_tacacs_session_t	*session;
+	fr_pair_t			*vp, *copy;
 
 	PROCESS_TRACE;
 
@@ -812,7 +817,6 @@ RESUME(auth_get)
 	session = request_data_reference(request, inst, 0);
 	if (!session) {
 		fr_tacacs_packet_t const *packet = (fr_tacacs_packet_t const *) request->packet->data;
-		fr_pair_t *vp, *copy;
 
 		if (!packet_is_authen_start_request(packet)) goto send_reply;
 
@@ -833,12 +837,17 @@ RESUME(auth_get)
 	if (!vp) break; \
 	MEM(copy = fr_pair_copy(session, vp));	\
 	fr_pair_append(&session->list, copy); \
+	RDEBUG2("%pP", copy); \
 } while (0)
 
+		RDEBUG2("Caching session attributes:");
+		RINDENT();
 		COPY(attr_user_name);
 		COPY(attr_tacacs_client_port);
 		COPY(attr_tacacs_remote_address);
 		COPY(attr_tacacs_privilege_level);
+		COPY(attr_tacacs_authentication_type);
+		REXDENT();
 
 	} else {
 		session->rounds++;
@@ -849,10 +858,21 @@ RESUME(auth_get)
 		}
 
 		/*
-		 *	There's no need to cache the User-Password, as the "getpass" packet is the last one in
-		 *	the chain.  The client will send a "continue" packet containing the password, and the
-		 *	admin will reply to that with pass/fail.
+		 *	It is possible that the user name or password are added on subsequent Authentication-Continue
+		 *	packets following replies with Authentication-GetUser or Authentication-GetPass.
+		 *	Check if they are already in the session cache, and if not, add them.
 		 */
+#define COPY_MISSING(_attr) do { \
+	vp = fr_pair_find_by_da(&session->list, NULL, _attr); \
+	if (vp) break; \
+	COPY(_attr); \
+} while (0)
+
+		RDEBUG2("Caching additional session attributes:");
+		RINDENT();
+		COPY_MISSING(attr_user_name);
+		COPY_MISSING(attr_user_password);
+		REXDENT();
 	}
 	session->reply = request->reply->code;
 	session->seq_no = request->packet->data[2];
@@ -884,13 +904,50 @@ RECV(auth_cont)
 	 */
 	session = request_data_reference(request, inst, 0);
 	if (session) {
+		fr_pair_t *vp = NULL, *copy;
+
 		if (request->packet->data[2] <= session->seq_no) {
 			REDEBUG("Client sent invalid sequence number %02x, expected >%02x", request->packet->data[2], session->seq_no);
 		error:
 			return CALL_SEND_TYPE(FR_TACACS_CODE_AUTH_ERROR);
 		}
 
+		if (fr_debug_lvl >= L_DBG_LVL_2) {
+			RDEBUG2("Restoring session attributes:");
+			RINDENT();
+			while ((vp = fr_pair_list_next(&session->list, vp))) {
+				RDEBUG2("%pP", vp);
+			}
+			REXDENT();
+		}
 		if (fr_pair_list_copy(request->request_ctx, &request->request_pairs, &session->list) < 0) goto error;
+
+		/*
+		 *	Copy the returned user_message into the attribute we requested.
+		 */
+#define EXTRACT(_attr) \
+	vp = fr_pair_find_by_da(&request->request_pairs, NULL, attr_tacacs_user_message); \
+	if (!vp) break; \
+	if (pair_append_request(&copy, _attr) < 0) break; \
+	if (fr_pair_value_copy(copy, vp) < 0) { \
+		fr_pair_remove(&request->request_pairs, copy); \
+		talloc_free(copy); \
+		break; \
+	} \
+	RDEBUG2("Populated %pP from user_message", copy)
+
+		switch (session->reply) {
+		case FR_TACACS_CODE_AUTH_GETUSER:
+			EXTRACT(attr_user_name);
+			break;
+
+		case FR_TACACS_CODE_AUTH_GETPASS:
+			EXTRACT(attr_user_password);
+			break;
+
+		default:
+			break;
+		}
 	}
 
 	return CALL_RECV(generic);
@@ -1118,6 +1175,11 @@ static unlang_action_t mod_process(rlm_rcode_t *p_result, module_ctx_t const *mc
 	fr_assert(request->dict == dict_tacacs);
 
 	UPDATE_STATE(packet);
+
+	if (!state->recv) {
+		REDEBUG("Invalid packet type (%u)", request->packet->code);
+		RETURN_MODULE_FAIL;
+	}
 
 	// @todo - debug stuff!
 //	tacacs_packet_debug(request, request->packet, &request->request_pairs, true);

@@ -324,7 +324,7 @@ static xlat_action_t mschap_xlat(TALLOC_CTX *ctx, fr_dcursor_t *out,
 	 *	hash of MS-CHAPv2 challenge, and peer challenge.
 	 */
 	if (strncasecmp(arg->vb_strvalue, "Challenge", 9) == 0) {
-		chap_challenge = fr_pair_find_by_da(&request->request_pairs, NULL, attr_ms_chap_challenge);
+		chap_challenge = fr_pair_find_by_da_nested(&request->request_pairs, NULL, attr_ms_chap_challenge);
 		if (!chap_challenge) {
 			REDEBUG("No MS-CHAP-Challenge in the request");
 			return XLAT_ACTION_FAIL;
@@ -350,7 +350,7 @@ static xlat_action_t mschap_xlat(TALLOC_CTX *ctx, fr_dcursor_t *out,
 			char const	*username_str;
 			size_t		username_len;
 
-			response = fr_pair_find_by_da(&request->request_pairs, NULL, attr_ms_chap2_response);
+			response = fr_pair_find_by_da_nested(&request->request_pairs, NULL, attr_ms_chap2_response);
 			if (!response) {
 				REDEBUG("Vendor-Specific.Microsoft.CHAP2-Response is required to calculate MS-CHAPv1 challenge");
 				return XLAT_ACTION_FAIL;
@@ -428,8 +428,8 @@ static xlat_action_t mschap_xlat(TALLOC_CTX *ctx, fr_dcursor_t *out,
 	 *	response.
 	 */
 	} else if (strncasecmp(arg->vb_strvalue, "NT-Response", 11) == 0) {
-		response = fr_pair_find_by_da(&request->request_pairs, NULL, attr_ms_chap_response);
-		if (!response) response = fr_pair_find_by_da(&request->request_pairs, NULL, attr_ms_chap2_response);
+		response = fr_pair_find_by_da_nested(&request->request_pairs, NULL, attr_ms_chap_response);
+		if (!response) response = fr_pair_find_by_da_nested(&request->request_pairs, NULL, attr_ms_chap2_response);
 		if (!response) {
 			REDEBUG("No MS-CHAP-Response or MS-CHAP2-Response was found in the request");
 			return XLAT_ACTION_FAIL;
@@ -463,7 +463,7 @@ static xlat_action_t mschap_xlat(TALLOC_CTX *ctx, fr_dcursor_t *out,
 	 *	in MS-CHAPv1, and not often there.
 	 */
 	} else if (strncasecmp(arg->vb_strvalue, "LM-Response", 11) == 0) {
-		response = fr_pair_find_by_da(&request->request_pairs, NULL, attr_ms_chap_response);
+		response = fr_pair_find_by_da_nested(&request->request_pairs, NULL, attr_ms_chap_response);
 		if (!response) {
 			REDEBUG("No MS-CHAP-Response was found in the request");
 			return XLAT_ACTION_FAIL;
@@ -653,7 +653,7 @@ static xlat_action_t mschap_xlat(TALLOC_CTX *ctx, fr_dcursor_t *out,
 			return XLAT_ACTION_FAIL;
 
 		if (mschap_nt_password_hash(buffer, arg->vb_strvalue) < 0) {
-			REDEBUG("Failed generating NT-Password");
+			REDEBUG("Failed generating Password.NT");
 			*buffer = '\0';
 			return XLAT_ACTION_FAIL;
 		}
@@ -973,7 +973,7 @@ ntlm_auth_err:
  		int		ntlen = sizeof(nt_pass_decrypted);
 
 		if (!nt_password) {
-			RDEBUG2("Local MS-CHAPv2 password change requires NT-Password attribute");
+			RDEBUG2("Local MS-CHAPv2 password change requires Password.NT attribute");
 			return -1;
 		} else {
 			RDEBUG2("Doing MS-CHAPv2 password change locally");
@@ -1013,7 +1013,7 @@ ntlm_auth_err:
 		if ((nt_pass_decrypted[514] != 0) ||
 		    (nt_pass_decrypted[515] != 0)) {
 			REDEBUG("Decrypted new password blob claims length > 65536, "
-				"probably an invalid NT-Password");
+				"probably an invalid Password.NT");
 			return -1;
 		}
 
@@ -1022,7 +1022,7 @@ ntlm_auth_err:
 		 */
 		if (passlen > 512) {
 			REDEBUG("Decrypted new password blob claims length %zu > 512, "
-				"probably an invalid NT-Password", passlen);
+				"probably an invalid Password.NT", passlen);
 			return -1;
 		}
 
@@ -1119,7 +1119,7 @@ ntlm_auth_err:
 		RDEBUG2("MS-CHAPv2 password change succeeded: %s", result);
 
 		/*
-		 *  Update the NT-Password attribute with the new hash this lets us
+		 *  Update the Password.NT attribute with the new hash this lets us
 		 *  fall through to the authentication code using the new hash,
 		 *  not the old one.
 		 */
@@ -1169,7 +1169,7 @@ static int CC_HINT(nonnull (1, 2, 4, 5, 6)) do_mschap(rlm_mschap_t const *inst,
 		 *	No password: can't do authentication.
 		 */
 		if (!password) {
-			REDEBUG("FAILED: No NT/LM-Password.  Cannot perform authentication");
+			REDEBUG("FAILED: No Password.NT/LM.  Cannot perform authentication");
 			return -1;
 		}
 
@@ -1456,13 +1456,20 @@ static unlang_action_t CC_HINT(nonnull) mod_authorize(rlm_rcode_t *p_result, mod
 {
 	rlm_mschap_t const 	*inst = talloc_get_type_abort_const(mctx->inst->data, rlm_mschap_t);
 	fr_pair_t		*challenge = NULL;
+	fr_pair_t		*parent;
 
-	challenge = fr_pair_find_by_da(&request->request_pairs, NULL, attr_ms_chap_challenge);
+	challenge = fr_pair_find_by_da_nested(&request->request_pairs, NULL, attr_ms_chap_challenge);
 	if (!challenge) RETURN_MODULE_NOOP;
 
-	if (!fr_pair_find_by_da(&request->request_pairs, NULL, attr_ms_chap_response) &&
-	    !fr_pair_find_by_da(&request->request_pairs, NULL, attr_ms_chap2_response) &&
-	    !fr_pair_find_by_da(&request->request_pairs, NULL, attr_ms_chap2_cpw)) {
+	/*
+	 *	The responses MUST be in the same group as the challenge.
+	 */
+	parent = fr_pair_parent(challenge);
+	fr_assert(parent != NULL);
+
+	if (!fr_pair_find_by_da(&parent->vp_group, NULL, attr_ms_chap_response) &&
+	    !fr_pair_find_by_da(&parent->vp_group, NULL, attr_ms_chap2_response) &&
+	    !fr_pair_find_by_da(&parent->vp_group, NULL, attr_ms_chap2_cpw)) {
 		RDEBUG2("Found MS-CHAP-Challenge, but no MS-CHAP response or Change-Password");
 		RETURN_MODULE_NOOP;
 	}
@@ -1564,13 +1571,13 @@ static unlang_action_t mschap_error(rlm_rcode_t *p_result, rlm_mschap_t const *i
 }
 
 
-/** Find an NT-Password value, or create one from a Password.Cleartext, or Password.With-Header attribute
+/** Find a Password.NT value, or create one from a Password.Cleartext, or Password.With-Header attribute
  *
  * @param[out] ephemeral	Whether we created a new password
  *				attribute.  Usually the caller will
  *				either want to insert this into a
  *				list or free it.
- * @param[out] out		Our new NT-Password.
+ * @param[out] out		Our new Password.NT.
  * @param[in] inst		Module configuration.
  * @param[in] request		The current request.
  * @return
@@ -1604,7 +1611,7 @@ static int CC_HINT(nonnull(1, 2, 3)) nt_password_find(bool *ephemeral, fr_pair_t
 			/*
 			 *	If we're doing internal auth, then this is an issue
 			 */
-			RWDEBUG2("No &control.%s or &control.%s found.  Cannot create NT-Password",
+			RWDEBUG2("No &control.%s or &control.%s found.  Cannot create Password.NT",
 				 attr_cleartext_password->name, attr_nt_password->name);
 			return -1;
 
@@ -1627,7 +1634,7 @@ found_password:
 		ret = mschap_nt_password_hash(p, password->vp_strvalue);
 
 		if (ret < 0) {
-			RERROR("Failed generating NT-Password");
+			RERROR("Failed generating Password.NT");
 			talloc_free(nt_password);
 			if (*ephemeral) TALLOC_FREE(password);
 			return -1;
@@ -1923,7 +1930,7 @@ static unlang_action_t CC_HINT(nonnull(1,2,3,4,5,8,9)) mschap_process_v2_respons
 
 #ifdef __APPLE__
 		/*
-		 *  No "known good" NT-Password attribute.  Try to do
+		 *  No "known good" Password.NT attribute.  Try to do
 		 *  OpenDirectory authentication.
 		 *
 		 *  If OD determines the user is an AD user it will return noop, which
@@ -1931,7 +1938,7 @@ static unlang_action_t CC_HINT(nonnull(1,2,3,4,5,8,9)) mschap_process_v2_respons
 		 *  Otherwise OD will determine auth success/fail.
 		 */
 		if (!nt_password && inst->open_directory) {
-			RDEBUG2("No NT-Password available. Trying OpenDirectory Authentication");
+			RDEBUG2("No Password.NT available. Trying OpenDirectory Authentication");
 			rcode = od_mschap_auth(request, challenge, user_name);
 			if (rcode != RLM_MODULE_NOOP) RETURN_MODULE_RCODE(rcode);
 		}
@@ -2016,6 +2023,7 @@ static unlang_action_t CC_HINT(nonnull) mod_authenticate(rlm_rcode_t *p_result, 
 	fr_pair_t		*challenge = NULL;
 	fr_pair_t		*response = NULL;
 	fr_pair_t		*cpw = NULL;
+	fr_pair_t		*parent;
 	fr_pair_t		*nt_password = NULL, *smb_ctrl;
 	uint8_t			nthashhash[NT_DIGEST_LENGTH];
 	int			mschap_version = 0;
@@ -2069,9 +2077,9 @@ static unlang_action_t CC_HINT(nonnull) mod_authenticate(rlm_rcode_t *p_result, 
 	}
 
 	/*
-	 *	Look for or create an NT-Password
+	 *	Look for or create an Password.NT
 	 *
-	 *      NT-Password can be NULL here if we didn't find an
+	 *      Password.NT can be NULL here if we didn't find an
 	 *	input attribute, and we're calling out to an
 	 *	external password store.
 	 */
@@ -2081,7 +2089,7 @@ static unlang_action_t CC_HINT(nonnull) mod_authenticate(rlm_rcode_t *p_result, 
 	 *	Check to see if this is a change password request, and process
 	 *	it accordingly if so.
 	 */
-	cpw = fr_pair_find_by_da(&request->request_pairs, NULL, attr_ms_chap2_cpw);
+	cpw = fr_pair_find_by_da_nested(&request->request_pairs, NULL, attr_ms_chap2_cpw);
 	if (cpw) {
 		uint8_t		*p;
 
@@ -2113,7 +2121,7 @@ static unlang_action_t CC_HINT(nonnull) mod_authenticate(rlm_rcode_t *p_result, 
 		memcpy(p + 2, cpw->vp_octets + 18, 48);
 	}
 
-	challenge = fr_pair_find_by_da(&request->request_pairs, NULL, attr_ms_chap_challenge);
+	challenge = fr_pair_find_by_da_nested(&request->request_pairs, NULL, attr_ms_chap_challenge);
 	if (!challenge) {
 		REDEBUG("&control.Auth-Type = %s set for a request that does not contain &%s",
 			mctx->inst->name, attr_ms_chap_challenge->name);
@@ -2122,9 +2130,15 @@ static unlang_action_t CC_HINT(nonnull) mod_authenticate(rlm_rcode_t *p_result, 
 	}
 
 	/*
+	 *	The responses MUST be in the same group as the challenge.
+	 */
+	parent = fr_pair_parent(challenge);
+	fr_assert(parent != NULL);
+
+	/*
 	 *	We also require an MS-CHAP-Response.
 	 */
-	if ((response = fr_pair_find_by_da(&request->request_pairs, NULL, attr_ms_chap_response))) {
+	if ((response = fr_pair_find_by_da(&parent->vp_group, NULL, attr_ms_chap_response))) {
 		mschap_process_response(&rcode,
 					&mschap_version, nthashhash,
 					inst, request,
@@ -2132,7 +2146,7 @@ static unlang_action_t CC_HINT(nonnull) mod_authenticate(rlm_rcode_t *p_result, 
 					challenge, response,
 					method);
 		if (rcode != RLM_MODULE_OK) goto finish;
-	} else if ((response = fr_pair_find_by_da(&request->request_pairs, NULL, attr_ms_chap2_response))) {
+	} else if ((response = fr_pair_find_by_da_nested(&parent->vp_group, NULL, attr_ms_chap2_response))) {
 		mschap_process_v2_response(&rcode,
 					   &mschap_version, nthashhash,
 					   inst, request,

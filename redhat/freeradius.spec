@@ -15,6 +15,9 @@
 # Build without OpenLDAP (no rlm_ldap, proto_ldap_sync)
 %bcond_without ldap
 
+# Build without Python
+%bcond_without rlm_python
+
 # Many distributions have extremely old versions of OpenSSL
 # if you'd like to build with the FreeRADIUS openssl packages
 # which are installed in /opt/openssl you should pass
@@ -360,15 +363,22 @@ BuildRequires: perl(ExtUtils::Embed)
 %description perl
 This plugin provides Perl support for the FreeRADIUS server project.
 
+%if %{with rlm_python}
 %package python
 Summary: Python support for FreeRADIUS
 Group: System Environment/Daemons
 Requires: %{name}%{?_isa} = %{version}-%{release}
+%if 0%{?rhel} < 9
+Requires: python38
+BuildRequires: python38-devel
+%else
 Requires: python3
 BuildRequires: python3-devel
+%endif
 
 %description python
 This plugin provides Python support for the FreeRADIUS server project.
+%endif
 
 %package mysql
 Summary: MySQL support for FreeRADIUS
@@ -598,7 +608,11 @@ export LDFLAGS="-Wl,--build-id"
 export RADIUSD_VERSION_RELEASE="%{release}"
 %endif
 
-%define autoconf_with() %{expand:%%{?with_%{1}:--with-%{1}}%%{!?with_%{1}:--without-%{1}}}
+# Due to an autoconf quirk --with-modules=<module> and --without-<module> are actually correct.
+# --with-modules forms the module list we want to explicitly configure, and --without-<module>
+# is ignored by the main configure script, but passed down to the individual configure scripts
+# where it's used to turn the configure run for the module into a noop.
+%define autoconf_mod_with() %{expand:%%{?with_%{1}:--with-modules=%{1}}%%{!?with_%{1}:--without-%{1}}}
 
 %configure \
         --libdir=%{_libdir}/freeradius \
@@ -608,16 +622,17 @@ export RADIUSD_VERSION_RELEASE="%{release}"
         --with-threads \
         --with-thread-pool \
         --with-docdir=%{docdir} \
-        %{autoconf_with experimental-modules} \
-        %{autoconf_with rlm_cache_memcached} \
-        %{autoconf_with rlm_idn} \
-        %{autoconf_with rlm_lua} \
-        %{autoconf_with rlm_mruby} \
-        %{autoconf_with rlm_opendirectory} \
-        %{autoconf_with rlm_securid} \
-        %{autoconf_with rlm_sigtran} \
-        %{autoconf_with rlm_sql_oracle} \
-        %{autoconf_with rlm_yubikey} \
+        %{autoconf_mod_with experimental-modules} \
+        %{autoconf_mod_with rlm_cache_memcached} \
+        %{autoconf_mod_with rlm_idn} \
+        %{autoconf_mod_with rlm_lua} \
+        %{autoconf_mod_with rlm_mruby} \
+        %{autoconf_mod_with rlm_opendirectory} \
+        %{autoconf_mod_with rlm_python} \
+        %{autoconf_mod_with rlm_securid} \
+        %{autoconf_mod_with rlm_sigtran} \
+        %{autoconf_mod_with rlm_sql_oracle} \
+        %{autoconf_mod_with rlm_yubikey} \
 %if %{without ldap}
         --without-libfreeradius-ldap \
 %else
@@ -928,7 +943,6 @@ fi
 %{_libdir}/freeradius/libfreeradius-io.so
 %{_libdir}/freeradius/libfreeradius-server.so
 %{_libdir}/freeradius/libfreeradius-sim.so
-%{_libdir}/freeradius/libfreeradius-soh.so
 %{_libdir}/freeradius/libfreeradius-tacacs.so
 %{_libdir}/freeradius/libfreeradius-tftp.so
 %{_libdir}/freeradius/libfreeradius-tls.so
@@ -977,7 +991,6 @@ fi
 %{_libdir}/freeradius/rlm_radius.so
 %{_libdir}/freeradius/rlm_radius_udp.so
 %{_libdir}/freeradius/rlm_radutmp.so
-%{_libdir}/freeradius/rlm_soh.so
 %{_libdir}/freeradius/rlm_sometimes.so
 %{_libdir}/freeradius/rlm_sql.so
 %{_libdir}/freeradius/rlm_sql_null.so
@@ -1173,10 +1186,12 @@ fi
 %attr(640,root,radiusd) %config(noreplace) %{_sysconfdir}/raddb/mods-config/perl
 %{_libdir}/freeradius/rlm_perl.so
 
+%if %{with rlm_python}
 %files python
 %defattr(-,root,root,750)
 %attr(640,root,radiusd) %config(noreplace) %{_sysconfdir}/raddb/mods-config/python
 %{_libdir}/freeradius/rlm_python.so
+%endif
 
 %files mysql
 %defattr(-,root,root)

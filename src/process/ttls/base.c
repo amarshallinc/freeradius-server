@@ -534,7 +534,7 @@ RESUME(auth_type)
 	return state->send(p_result, mctx, request);
 }
 
-RESUME_NO_RCTX(access_accept)
+RESUME(access_accept)
 {
 	fr_pair_t			*vp;
 	process_ttls_t const		*inst = talloc_get_type_abort_const(mctx->inst->data, process_ttls_t);
@@ -567,7 +567,7 @@ RESUME_NO_RCTX(access_accept)
 	RETURN_MODULE_OK;
 }
 
-RESUME_NO_RCTX(access_reject)
+RESUME(access_reject)
 {
 	fr_pair_t			*vp;
 	process_ttls_t const		*inst = talloc_get_type_abort_const(mctx->inst->data, process_ttls_t);
@@ -619,7 +619,7 @@ RESUME(protocol_error)
 	/*
 	 *	https://tools.ietf.org/html/rfc7930#section-4
 	 */
-	vp = fr_pair_find_by_da(&request->reply_pairs, NULL, attr_original_packet_code);
+	vp = fr_pair_find_by_da_nested(&request->reply_pairs, NULL, attr_original_packet_code);
 	if (!vp) {
 		vp = fr_pair_afrom_da(request->reply_ctx, attr_original_packet_code);
 		if (vp) {

@@ -94,12 +94,18 @@ static int mod_decode(void const *instance, request_t *request, uint8_t *const d
 	return inst->parent->work_io->decode(inst->parent->work_io_instance, request, data, data_len);
 }
 
-static ssize_t mod_write(fr_listen_t *li, void *packet_ctx, fr_time_t request_time,
-			 uint8_t *buffer, size_t buffer_len, size_t written)
+static ssize_t mod_write(UNUSED fr_listen_t *li, UNUSED void *packet_ctx, UNUSED fr_time_t request_time,
+			 UNUSED uint8_t *buffer, UNUSED size_t buffer_len, UNUSED size_t written)
 {
+#if 1
+	fr_assert(0);
+
+	return -1;
+#else
 	proto_detail_file_thread_t  *thread = talloc_get_type_abort(li->thread_instance, proto_detail_file_thread_t);
 
 	return thread->listen->app_io->write(thread->listen, packet_ctx, request_time, buffer, buffer_len, written);
+#endif
 }
 
 static void mod_vnode_extend(fr_listen_t *li, UNUSED uint32_t fflags)
@@ -148,6 +154,8 @@ static int mod_open(fr_listen_t *li)
 	thread->name = talloc_typed_asprintf(thread, "detail_file which will read files matching %s", inst->filename);
 	thread->vnode_fd = -1;
 	pthread_mutex_init(&thread->worker_mutex, NULL);
+
+	li->no_write_callback = true;
 
 	return 0;
 }

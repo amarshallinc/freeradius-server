@@ -43,7 +43,9 @@ typedef enum ippool_tool_action {
 	IPPOOL_TOOL_REMOVE,			//!< Remove one or more IP addresses.
 	IPPOOL_TOOL_RELEASE,			//!< Release one or more IP addresses.
 	IPPOOL_TOOL_SHOW,			//!< Show one or more IP addresses.
-	IPPOOL_TOOL_MODIFY			//!< Modify attributes of one or more IP addresses.
+	IPPOOL_TOOL_MODIFY,			//!< Modify attributes of one or more IP addresses.
+	IPPOOL_TOOL_ASSIGN,			//!< Assign a static IP address to a device.
+	IPPOOL_TOOL_UNASSIGN			//!< Remove static IP address assignment.
 } ippool_tool_action_t;
 
 /** A single pool operation
@@ -83,6 +85,12 @@ typedef struct {
 	uint64_t		expiring_30m;	//!< Addresses that expire in the next 30 minutes.
 	uint64_t		expiring_1h;	//!< Addresses that expire in the next hour.
 	uint64_t		expiring_1d;	//!< Addresses that expire in the next day.
+	uint64_t		static_tot;	//!< Static assignments configured.
+	uint64_t		static_free;	//!< Static leases that have not been requested.
+	uint64_t		static_1m;	//!< Static leases that should renew in the next minute.
+	uint64_t		static_30m;	//!< Static leases that should renew in the next 30 minutes.
+	uint64_t		static_1h;	//!< Static leases that should renew in the next hour.
+	uint64_t		static_1d;	//!< Static leases that should renew in the next day.
 } ippool_tool_stats_t;
 
 static CONF_PARSER redis_config[] = {
@@ -100,10 +108,14 @@ typedef struct {
 	CONF_SECTION		*cs;
 } ippool_tool_t;
 
+typedef struct {
+	char const		*owner;
+} ippool_tool_owner_t;
+
 typedef int (*redis_ippool_queue_t)(redis_driver_conf_t *inst, fr_redis_conn_t *conn,
 				    uint8_t const *key_prefix, size_t key_prefix_len,
 				    uint8_t const *range, size_t range_len,
-				    fr_ipaddr_t *ipaddr, uint8_t prefix);
+				    fr_ipaddr_t *ipaddr, uint8_t prefix, void *uctx);
 
 typedef int (*redis_ippool_process_t)(void *out, fr_ipaddr_t const *ipaddr, redisReply const *reply);
 
@@ -120,6 +132,21 @@ do { \
 	} \
 	_p += (size_t)_slen;\
 	_p += strlcpy((char *)_p, _ip_str, sizeof(_buff) - (_p - _buff)); \
+} while (0)
+
+#define IPPOOL_BUILD_OWNER_KEY(_buff, _p, _key, _key_len, _owner) \
+do { \
+	ssize_t _slen; \
+	*_p++ = '{'; \
+	memcpy(_p, _key, _key_len); \
+	_p += _key_len; \
+	_slen = strlcpy((char *)_p, "}:"IPPOOL_OWNER_KEY":", sizeof(_buff) - (_p - _buff)); \
+	if (is_truncated((size_t)_slen, sizeof(_buff) - (_p - _buff))) { \
+		ERROR("Owner key too long"); \
+		return 0;\
+	} \
+	_p += (size_t)_slen;\
+	_p += strlcpy((char *)_p, _owner, sizeof(_buff) - (_p - _buff)); \
 } while (0)
 
 #define EOL "\n"
@@ -162,6 +189,123 @@ static char lua_release_cmd[] =
 	"redis.call('DEL', '{' .. KEYS[1] .. '}:"IPPOOL_OWNER_KEY":' .. found)" EOL	/* 11 */
 	"return 1";									/* 12 */
 
+/** Lua script for assigning a static lease
+ *
+ * - KEYS[1] The pool name.
+ * - ARGV[1] THE ip address to create a static assignment for.
+ * - ARGV[2] The owner to assign the static lease to.
+ * - ARGV[3] The range identifier.
+ * - ARGV[4] Wall time (seconds since epoch)
+ *
+ * Checks whether the IP already has a static assignment, and
+ * whether the owner is already associated with a different IP.
+ *
+ * If check pass, sets the static flag on the IP entry in the ZSET and
+ * creates the association between the IP and the owner.
+ *
+ * Returns
+ *  - 0 if no assignment is made.
+ *  - 1 if the IP assignment is made.
+ */
+static char lua_assign_cmd[] =
+	"local pool_key = '{' .. KEYS[1] .. '}:"IPPOOL_POOL_KEY"'" EOL			/* 1 */
+	"local owner_key = '{' .. KEYS[1] .. '}:"IPPOOL_OWNER_KEY":' .. ARGV[2]" EOL	/* 2 */
+	"local ip_key = '{' .. KEYS[1]..'}:"IPPOOL_ADDRESS_KEY":' .. ARGV[1]" EOL	/* 3 */
+
+	/*
+	 *	Check the address doesn't already have a static assignment.
+	 */
+	"local expires = tonumber(redis.call('ZSCORE', pool_key, ARGV[1]))" EOL		/* 4 */
+	"if expires and expires >= " STRINGIFY(IPPOOL_STATIC_BIT) " then" EOL		/* 5 */
+	"  return 0" EOL								/* 6 */
+	"end" EOL									/* 7 */
+
+	/*
+	 *	Check current assignment for device.
+	 */
+	"local found = redis.call('GET', owner_key)" EOL				/* 8 */
+	"if found and found ~= ARGV[1] then" EOL					/* 9 */
+	"  return 0" EOL								/* 10 */
+	"end" EOL									/* 11 */
+
+	/*
+	 *	If expires is in the future, check it is not
+	 *	another owner.
+	 */
+	"if expires and expires > tonumber(ARGV[4]) then" EOL				/* 12 */
+	"  found = redis.call('HGET', ip_key, 'device')"				/* 13 */
+	"  if found and found ~= ARGV[2] then" EOL					/* 14 */
+	"    return 0" EOL								/* 15 */
+	"  end" EOL									/* 16 */
+	"end" EOL									/* 17 */
+
+	/*
+	 *	All checks passed - set the assignment.
+	 */
+	"expires = (expires or 0) + " STRINGIFY(IPPOOL_STATIC_BIT) EOL			/* 18 */
+	"redis.call('ZADD', pool_key, 'CH', expires, ARGV[1])" EOL			/* 19 */
+	"redis.call('SET', owner_key, ARGV[1])" EOL					/* 20 */
+	"redis.call('HSET', ip_key, 'device', ARGV[2], 'counter', 0)" EOL		/* 21 */
+	"if ARGV[3] then" EOL								/* 22 */
+	"  redis.call('HSET', ip_key, range, ARGV[3])" EOL				/* 23 */
+	"end" EOL									/* 24 */
+	"return 1";									/* 25 */
+
+/** Lua script for un-assigning a static lease
+ *
+ * - KEYS[1] The pool name.
+ * - ARGV[1] IP address to remove static lease from.
+ * - ARGV[2] The owner the static lease should be removed from.
+ * - ARGV[3] Wall time (seconds since epoch).
+ *
+ * Removes the static flag from the IP entry in the ZSET, then, depending on the remaining time
+ * determined by the ZSCORE removes the address hash, and the device key.
+ *
+ * Will do nothing if the static assignment does not exist or the IP and device do not match.
+ *
+ * Returns
+ * - 0 if no ip addresses were unassigned.
+ * - 1 if an ip address was unassigned.
+ */
+static char lua_unassign_cmd[] =
+	"local found" EOL								/* 1 */
+	"local pool_key = '{' .. KEYS[1] .. '}:"IPPOOL_POOL_KEY"'" EOL			/* 2 */
+	"local owner_key = '{' .. KEYS[1] .. '}:"IPPOOL_OWNER_KEY":' .. ARGV[2]" EOL	/* 3 */
+
+	/*
+	 *	Check that the device hash exists and points at the correct IP
+	 */
+	"found = redis.call('GET', owner_key)" EOL					/* 4 */
+	"if not found or found ~= ARGV[1] then" EOL					/* 5 */
+	"  return 0" EOL								/* 6 */
+	"end"	 EOL									/* 7 */
+
+	/*
+	 *	Check the assignment is actually static
+	 */
+	"local expires = tonumber(redis.call('ZSCORE', pool_key, ARGV[1]))" EOL		/* 8 */
+	"local static = expires >= " STRINGIFY(IPPOOL_STATIC_BIT) EOL			/* 9 */
+	"if not static then" EOL							/* 10 */
+	" return 0" EOL									/* 11 */
+	"end" EOL									/* 12 */
+
+	/*
+	 *	Remove static bit from ZSCORE
+	 */
+	"expires = expires - " STRINGIFY(IPPOOL_STATIC_BIT) EOL				/* 13 */
+	"redis.call('ZADD', pool_key, 'XX', expires, ARGV[1])" EOL			/* 14 */
+
+	/*
+	 *	If the lease still has time left, set an expiry on the device key.
+	 *	otherwise delete it.
+	 */
+	"if expires > tonumber(ARGV[3]) then" EOL					/* 15 */
+	"  redis.call('EXPIRE', owner_key, expires - tonumber(ARGV[3]))" EOL		/* 16 */
+	"else" EOL									/* 17 */
+	"  redis.call('DEL', owner_key)" EOL						/* 18 */
+	"end" EOL									/* 19 */
+	"return 1";									/* 20 */
+
 /** Lua script for removing a lease
  *
  * - KEYS[1] The pool name.
@@ -203,6 +347,9 @@ static NEVER_RETURNS void usage(int ret) {
 	INFO("  -d range               Delete address(es)/prefix(es) in this range.");
 	INFO("  -r range               Release address(es)/prefix(es) in this range.");
 	INFO("  -s range               Show addresses/prefix in this range.");
+	INFO("  -A address/prefix      Assign a static lease.");
+	INFO("  -O owner               To use when assigning a static lease.");
+	INFO("  -U address/prefix      Un-assign a static lease");
 	INFO("  -p prefix_len          Length of prefix to allocate (defaults to 32/128)");
 	INFO("                         This is used primarily for IPv6 where a prefix is");
 	INFO("                         allocated to an intermediary router, which in turn");
@@ -305,7 +452,7 @@ static bool ipaddr_next(fr_ipaddr_t *ipaddr, fr_ipaddr_t const *end, uint8_t pre
  * @return the number of new addresses added.
  */
 static int driver_do_lease(void *out, void *instance, ippool_tool_operation_t const *op,
-			   redis_ippool_queue_t enqueue, redis_ippool_process_t process)
+			   redis_ippool_queue_t enqueue, redis_ippool_process_t process, void *uctx)
 {
 	redis_driver_conf_t		*inst = talloc_get_type_abort(instance, redis_driver_conf_t);
 
@@ -343,7 +490,7 @@ static int driver_do_lease(void *out, void *instance, ippool_tool_operation_t co
 				int enqueued;
 
 				enqueued = enqueue(inst, conn, op->pool, op->pool_len,
-						   op->range, op->range_len, &ipaddr, op->prefix);
+						   op->range, op->range_len, &ipaddr, op->prefix, uctx);
 				if (enqueued < 0) break;
 				pipelined += enqueued;
 			}
@@ -432,7 +579,7 @@ static int _driver_show_lease_process(void *out, fr_ipaddr_t const *ipaddr, redi
 static int _driver_show_lease_enqueue(UNUSED redis_driver_conf_t *inst, fr_redis_conn_t *conn,
 				      uint8_t const *key_prefix, size_t key_prefix_len,
 				      UNUSED uint8_t const *range, UNUSED size_t range_len,
-				      fr_ipaddr_t *ipaddr, uint8_t prefix)
+				      fr_ipaddr_t *ipaddr, uint8_t prefix, UNUSED void *uctx)
 {
 	uint8_t		key[IPPOOL_MAX_POOL_KEY_SIZE];
 	uint8_t		*key_p = key;
@@ -462,7 +609,7 @@ static int _driver_show_lease_enqueue(UNUSED redis_driver_conf_t *inst, fr_redis
  */
 static inline int driver_show_lease(void *out, void *instance, ippool_tool_operation_t const *op)
 {
-	return driver_do_lease(out, instance, op, _driver_show_lease_enqueue, _driver_show_lease_process);
+	return driver_do_lease(out, instance, op, _driver_show_lease_enqueue, _driver_show_lease_process, NULL);
 }
 
 /** Count the number of leases we released
@@ -489,7 +636,7 @@ static int _driver_release_lease_process(void *out, UNUSED fr_ipaddr_t const *ip
 static int _driver_release_lease_enqueue(UNUSED redis_driver_conf_t *inst, fr_redis_conn_t *conn,
 					 uint8_t const *key_prefix, size_t key_prefix_len,
 					 UNUSED uint8_t const *range, UNUSED size_t range_len,
-					 fr_ipaddr_t *ipaddr, uint8_t prefix)
+					 fr_ipaddr_t *ipaddr, uint8_t prefix, UNUSED void *uctx)
 {
 	char		ip_buff[FR_IPADDR_PREFIX_STRLEN];
 
@@ -507,7 +654,7 @@ static int _driver_release_lease_enqueue(UNUSED redis_driver_conf_t *inst, fr_re
 static inline int driver_release_lease(void *out, void *instance, ippool_tool_operation_t const *op)
 {
 	return driver_do_lease(out, instance, op,
-			       _driver_release_lease_enqueue, _driver_release_lease_process);
+			       _driver_release_lease_enqueue, _driver_release_lease_process, NULL);
 }
 
 /** Count the number of leases we removed
@@ -538,7 +685,7 @@ static int _driver_remove_lease_process(void *out, UNUSED fr_ipaddr_t const *ipa
 static int _driver_remove_lease_enqueue(UNUSED redis_driver_conf_t *inst, fr_redis_conn_t *conn,
 					uint8_t const *key_prefix, size_t key_prefix_len,
 					UNUSED uint8_t const *range, UNUSED size_t range_len,
-					fr_ipaddr_t *ipaddr, uint8_t prefix)
+					fr_ipaddr_t *ipaddr, uint8_t prefix, UNUSED void *uctx)
 {
 	char		ip_buff[FR_IPADDR_PREFIX_STRLEN];
 
@@ -556,7 +703,7 @@ static int _driver_remove_lease_enqueue(UNUSED redis_driver_conf_t *inst, fr_red
 static int driver_remove_lease(void *out, void *instance, ippool_tool_operation_t const *op)
 {
 	return driver_do_lease(out, instance, op,
-			       _driver_remove_lease_enqueue, _driver_remove_lease_process);
+			       _driver_remove_lease_enqueue, _driver_remove_lease_process, NULL);
 }
 
 /** Count the number of leases we actually added
@@ -586,7 +733,7 @@ static int _driver_add_lease_process(void *out, UNUSED fr_ipaddr_t const *ipaddr
 static int _driver_add_lease_enqueue(UNUSED redis_driver_conf_t *inst, fr_redis_conn_t *conn,
 				     uint8_t const *key_prefix, size_t key_prefix_len,
 				     uint8_t const *range, size_t range_len,
-				     fr_ipaddr_t *ipaddr, uint8_t prefix)
+				     fr_ipaddr_t *ipaddr, uint8_t prefix, UNUSED void *uctx)
 {
 	uint8_t		key[IPPOOL_MAX_POOL_KEY_SIZE];
 	uint8_t		*key_p = key;
@@ -627,7 +774,7 @@ static int _driver_add_lease_enqueue(UNUSED redis_driver_conf_t *inst, fr_redis_
  */
 static int driver_add_lease(void *out, void *instance, ippool_tool_operation_t const *op)
 {
-	return driver_do_lease(out, instance, op, _driver_add_lease_enqueue, _driver_add_lease_process);
+	return driver_do_lease(out, instance, op, _driver_add_lease_enqueue, _driver_add_lease_process, NULL);
 }
 
 /** Count the number of leases we modified
@@ -659,7 +806,7 @@ static int _driver_modify_lease_process(void *out, UNUSED fr_ipaddr_t const *ipa
 static int _driver_modify_lease_enqueue(UNUSED redis_driver_conf_t *inst, fr_redis_conn_t *conn,
 					uint8_t const *key_prefix, size_t key_prefix_len,
 					uint8_t const *range, size_t range_len,
-					fr_ipaddr_t *ipaddr, uint8_t prefix)
+					fr_ipaddr_t *ipaddr, uint8_t prefix, UNUSED void *uctx)
 {
 	uint8_t		key[IPPOOL_MAX_POOL_KEY_SIZE];
 	uint8_t		*key_p = key;
@@ -684,7 +831,92 @@ static int _driver_modify_lease_enqueue(UNUSED redis_driver_conf_t *inst, fr_red
 static int driver_modify_lease(void *out, void *instance, ippool_tool_operation_t const *op)
 {
 	return driver_do_lease(out, instance, op,
-			       _driver_modify_lease_enqueue, _driver_modify_lease_process);
+			       _driver_modify_lease_enqueue, _driver_modify_lease_process, NULL);
+}
+
+static int _driver_assign_lease_process(void *out, UNUSED fr_ipaddr_t const *ipaddr, redisReply const *reply)
+{
+	uint64_t *modified = out;
+	if (reply->type != REDIS_REPLY_INTEGER) return -1;
+
+	*modified += reply->integer;
+	return 0;
+}
+
+/** Enqueue static lease assignment commands
+ *
+ */
+static int _driver_assign_lease_enqueue(UNUSED redis_driver_conf_t *inst, fr_redis_conn_t *conn,
+				     uint8_t const *key_prefix, size_t key_prefix_len,
+				     uint8_t const *range, size_t range_len,
+				     fr_ipaddr_t *ipaddr, uint8_t prefix, void *uctx)
+{
+	ippool_tool_owner_t	*owner = uctx;
+	char		ip_buff[FR_IPADDR_PREFIX_STRLEN];
+	fr_time_t	now;
+
+	IPPOOL_SPRINT_IP(ip_buff, ipaddr, prefix);
+	now = fr_time();
+
+	DEBUG("Assigning address %s to owner %s", ip_buff, owner->owner);
+
+	redisAppendCommand(conn->handle, "EVAL %s 1 %b %s %b %b %i", lua_assign_cmd, key_prefix, key_prefix_len,
+			   ip_buff, owner->owner, strlen(owner->owner), range, range_len, fr_time_to_sec(now));
+	return 1;
+}
+
+/** Add static lease assignments
+ *
+ */
+static int driver_assign_lease(void *out, void *instance, ippool_tool_operation_t const *op, char const *owner)
+{
+	return driver_do_lease(out, instance, op,
+			       _driver_assign_lease_enqueue, _driver_assign_lease_process,
+			       &(ippool_tool_owner_t){ .owner = owner });
+}
+
+static int _driver_unassign_lease_process(void *out, UNUSED fr_ipaddr_t const *ipaddr, redisReply const *reply)
+{
+	uint64_t *modified = out;
+	/*
+	 *	Record the actual number of addresses unassigned.
+	 */
+	if (reply->type != REDIS_REPLY_INTEGER) return -1;
+
+	*modified += reply->integer;
+
+	return 0;
+}
+
+/** Enqueue static lease un-assignment commands
+ *
+ */
+static int _driver_unassign_lease_enqueue(UNUSED redis_driver_conf_t *inst, fr_redis_conn_t *conn,
+				     uint8_t const *key_prefix, size_t key_prefix_len,
+				     UNUSED uint8_t const *range, UNUSED size_t range_len,
+				     fr_ipaddr_t *ipaddr, uint8_t prefix, void *uctx)
+{
+	ippool_tool_owner_t	*owner = uctx;
+	char			ip_buff[FR_IPADDR_PREFIX_STRLEN];
+	fr_time_t		now;
+
+	IPPOOL_SPRINT_IP(ip_buff, ipaddr, prefix);
+	now = fr_time();
+
+	DEBUG("Un-assigning address %s from owner %s", ip_buff, owner->owner);
+	redisAppendCommand(conn->handle, "EVAL %s 1 %b %s %b %i", lua_unassign_cmd, key_prefix, key_prefix_len,
+			   ip_buff, owner->owner, strlen(owner->owner), fr_time_to_sec(now));
+	return 1;
+}
+
+/** Unassign static lease assignments
+ *
+ */
+static int driver_unassign_lease(void *out, void *instance, ippool_tool_operation_t const *op, char const *owner)
+{
+	return driver_do_lease(out, instance, op,
+			       _driver_unassign_lease_enqueue, _driver_unassign_lease_process,
+			       &(ippool_tool_owner_t){ .owner = owner });
 }
 
 /** Compare two pool names
@@ -726,7 +958,7 @@ static ssize_t driver_get_pools(TALLOC_CTX *ctx, uint8_t **out[], void *instance
 	uint8_t			*key_p = key;
 	uint8_t 		**result;
 
-	IPPOOL_BUILD_KEY(key, key_p, "*}:pool", 1);
+	IPPOOL_BUILD_KEY(key, key_p, "*}:"IPPOOL_POOL_KEY, 1);
 
 	*out = NULL;	/* Initialise output pointer */
 
@@ -862,12 +1094,12 @@ static ssize_t driver_get_pools(TALLOC_CTX *ctx, uint8_t **out[], void *instance
 	/*
 	 *	Sort the results
 	 */
-	{
+	if (used > 1) {
 		uint8_t const **to_sort;
 
 		memcpy(&to_sort, &result, sizeof(to_sort));
 
-		fr_quick_sort((void const **)to_sort, 0, used, pool_cmp);
+		fr_quick_sort((void const **)to_sort, 0, used - 1, pool_cmp);
 	}
 
 	*out = talloc_array(ctx, uint8_t *, used);
@@ -910,7 +1142,7 @@ static int driver_get_stats(ippool_tool_stats_t *out, void *instance, uint8_t co
 
 	size_t				reply_cnt = 0, i = 0;
 
-#define STATS_COMMANDS_TOTAL 8
+#define STATS_COMMANDS_TOTAL 14
 
 	IPPOOL_BUILD_KEY(key, key_p, key_prefix, key_prefix_len);
 
@@ -935,6 +1167,22 @@ static int driver_get_stats(ippool_tool_stats_t *out, void *instance, uint8_t co
 				   key, key_p - key, fr_time_to_sec(now) + (60 * 60));	/* Free in next 60 mins */
 		redisAppendCommand(conn->handle, "ZCOUNT %b -inf %i",
 				   key, key_p - key, fr_time_to_sec(now) + (60 * 60 * 24));	/* Free in next day */
+		redisAppendCommand(conn->handle, "ZCOUNT %b " STRINGIFY(IPPOOL_STATIC_BIT) " inf",
+				   key, key_p - key);					/* Total static */
+		redisAppendCommand(conn->handle, "ZCOUNT %b " STRINGIFY(IPPOOL_STATIC_BIT) " %"PRIu64,
+				   key, key_p - key, IPPOOL_STATIC_BIT + fr_time_to_sec(now));	/* Static assignments 'free' */
+		redisAppendCommand(conn->handle, "ZCOUNT %b " STRINGIFY(IPPOOL_STATIC_BIT) " %"PRIu64,
+				   key, key_p - key,
+				   IPPOOL_STATIC_BIT + fr_time_to_sec(now) + 60);	/* Static renew in 60s */
+		redisAppendCommand(conn->handle, "ZCOUNT %b " STRINGIFY(IPPOOL_STATIC_BIT) " %"PRIu64,
+				   key, key_p - key,
+				   IPPOOL_STATIC_BIT + fr_time_to_sec(now) + (60 * 30));	/* Static renew in 30 mins */
+		redisAppendCommand(conn->handle, "ZCOUNT %b " STRINGIFY(IPPOOL_STATIC_BIT) " %"PRIu64,
+				   key, key_p - key,
+				   IPPOOL_STATIC_BIT + fr_time_to_sec(now) + (60 * 60));	/* Static renew in 60 mins */
+		redisAppendCommand(conn->handle, "ZCOUNT %b " STRINGIFY(IPPOOL_STATIC_BIT) " %"PRIu64,
+				   key, key_p - key,
+				   IPPOOL_STATIC_BIT + fr_time_to_sec(now) + (60 * 60 * 24));	/* Static renew in 1 day */
 		redisAppendCommand(conn->handle, "EXEC");
 		if (!replies) return -1;
 
@@ -980,6 +1228,12 @@ static int driver_get_stats(ippool_tool_stats_t *out, void *instance, uint8_t co
 	out->expiring_30m = reply->element[3]->integer - out->free;
 	out->expiring_1h = reply->element[4]->integer - out->free;
 	out->expiring_1d = reply->element[5]->integer - out->free;
+	out->static_tot = reply->element[6]->integer;
+	out->static_free = reply->element[7]->integer;
+	out->static_1m = reply->element[8]->integer - out->static_free;
+	out->static_30m = reply->element[9]->integer - out->static_free;
+	out->static_1h = reply->element[10]->integer - out->static_free;
+	out->static_1d = reply->element[11]->integer - out->static_free;
 
 	fr_redis_pipeline_free(replies, reply_cnt);
 	talloc_free(replies);
@@ -1205,6 +1459,7 @@ int main(int argc, char *argv[])
 	bool				need_pool = false;
 	char				*do_import = NULL;
 	char const			*filename = NULL;
+	char const			*owner = NULL;
 
 	CONF_SECTION			*pool_cs;
 	CONF_PAIR			*cp;
@@ -1229,7 +1484,7 @@ do { \
 	need_pool = true; \
 } while (0);
 
-	while ((c = getopt(argc, argv, "a:d:r:s:Sm:p:ilLhxo:f:")) != -1) switch (c) {
+	while ((c = getopt(argc, argv, "a:d:r:s:Sm:A:U:O:p:ilLhxo:f:")) != -1) switch (c) {
 		case 'a':
 			ADD_ACTION(IPPOOL_TOOL_ADD);
 			break;
@@ -1248,6 +1503,18 @@ do { \
 
 		case 'm':
 			ADD_ACTION(IPPOOL_TOOL_MODIFY);
+			break;
+
+		case 'A':
+			ADD_ACTION(IPPOOL_TOOL_ASSIGN);
+			break;
+
+		case 'U':
+			ADD_ACTION(IPPOOL_TOOL_UNASSIGN);
+			break;
+
+		case 'O':
+			owner = optarg;
 			break;
 
 		case 'p':
@@ -1384,6 +1651,14 @@ do { \
 	if (!cp) {
 		(void) cf_pair_alloc(pool_cs, "min", "0", T_OP_EQ, T_BARE_WORD, T_BARE_WORD);
 	}
+	cp = cf_pair_find(pool_cs, "max");
+	if (!cp) {
+		/*
+		 *	Set a safe default for "max" - as this is a stand alone tool,
+		 *	it can't use automatic value from the worker thread count.
+		 */
+		(void) cf_pair_alloc(pool_cs, "max", "10", T_OP_EQ, T_BARE_WORD, T_BARE_WORD);
+	}
 
 	if (driver_init(conf, conf->cs, &conf->driver) < 0) {
 		ERROR("Driver initialisation failed");
@@ -1414,29 +1689,40 @@ do { \
 		}
 
 		for (i = 0; i < (size_t)slen; i++) {
-			uint64_t acum = 0;
-
 			if (driver_get_stats(&stats, conf->driver,
 					     pools[i], talloc_array_length(pools[i])) < 0) fr_exit_now(EXIT_FAILURE);
 
-			INFO("pool             : %pV", fr_box_strvalue_len((char *)pools[i],
+			INFO("pool                : %pV", fr_box_strvalue_len((char *)pools[i],
 									   talloc_array_length(pools[i])));
-			INFO("total            : %" PRIu64, stats.total);
-			INFO("free             : %" PRIu64, stats.free);
-			INFO("used             : %" PRIu64, stats.total - stats.free);
-			if (stats.total) {
-				INFO("used (%%)         : %.2Lf",
-				     ((long double)(stats.total - stats.free) / (long double)stats.total) * 100);
+			INFO("total               : %" PRIu64, stats.total);
+			INFO("dynamic total       : %" PRIu64, stats.total - stats.static_tot);
+			INFO("dynamic free        : %" PRIu64, stats.free);
+			INFO("dynamic used        : %" PRIu64, stats.total - stats.free - stats.static_tot);
+			if ((stats.total - stats.static_tot) > 0) {
+				INFO("dynamic used (%%)    : %.2Lf",
+				     ((long double)(stats.total - stats.free - stats.static_tot) /
+				      (long double)(stats.total - stats.static_tot)) * 100);
 			} else {
-				INFO("used (%%)         : 0");
+				INFO("used (%%)            : 0");
 			}
-			INFO("expiring 0-1m    : %" PRIu64, stats.expiring_1m);
-			acum += stats.expiring_1m;
-			INFO("expiring 1-30m   : %" PRIu64, stats.expiring_30m - acum);
-			acum += stats.expiring_30m;
-			INFO("expiring 30m-1h  : %" PRIu64, stats.expiring_1h - acum);
-			acum += stats.expiring_1h;
-			INFO("expiring 1h-1d   : %" PRIu64, stats.expiring_1d - acum);
+			INFO("expiring 0-1m       : %" PRIu64, stats.expiring_1m);
+			INFO("expiring 1-30m      : %" PRIu64, stats.expiring_30m - stats.expiring_1m);
+			INFO("expiring 30m-1h     : %" PRIu64, stats.expiring_1h - stats.expiring_30m);
+			INFO("expiring 1h-1d      : %" PRIu64, stats.expiring_1d - stats.expiring_1h);
+			INFO("static total        : %" PRIu64, stats.static_tot);
+			INFO("static 'free'       : %" PRIu64, stats.static_free);
+			INFO("static issued       : %" PRIu64, stats.static_tot - stats.static_free);
+			if (stats.static_tot) {
+				INFO("static issued (%%)   : %.2Lf",
+				     ((long double)(stats.static_tot - stats.static_free) /
+				      (long double)(stats.static_tot)) * 100);
+			} else {
+				INFO("static issued (%%)   : 0");
+			}
+			INFO("static renew 0-1m   : %" PRIu64, stats.static_1m);
+			INFO("static renew 1-30m  : %" PRIu64, stats.static_30m - stats.static_1m);
+			INFO("static renew 30m-1h : %" PRIu64, stats.static_1h - stats.static_30m);
+			INFO("static renew 1h-1d  : %" PRIu64, stats.static_1d - stats.static_1h);
 			INFO("--");
 		}
 	}
@@ -1585,6 +1871,46 @@ do { \
 			fr_exit_now(EXIT_FAILURE);
 		}
 		INFO("Modified %" PRIu64 " address(es)/prefix(es)", count);
+	}
+		continue;
+
+	case IPPOOL_TOOL_ASSIGN:
+	{
+		uint64_t count = 0;
+
+		if (fr_ipaddr_cmp(&p->start, &p->end) != 0) {
+			ERROR("Static assignment requires a single IP");
+			fr_exit_now(EXIT_FAILURE);
+		}
+		if (!owner) {
+			ERROR("Static assignment requires an owner");
+			fr_exit_now(EXIT_FAILURE);
+		}
+
+		if (driver_assign_lease(&count, conf->driver, p, owner) < 0) {
+			fr_exit_now(EXIT_FAILURE);
+		}
+		INFO("Assigned %" PRIu64 " address(es)/prefix(es)", count);
+	}
+		continue;
+
+	case IPPOOL_TOOL_UNASSIGN:
+	{
+		uint64_t count = 0;
+
+		if (fr_ipaddr_cmp(&p->start, &p->end) != 0) {
+			ERROR("Static lease un-assignment requires a single IP");
+			fr_exit_now(EXIT_FAILURE);
+		}
+		if (!owner) {
+			ERROR("Static lease un-assignment requires an owner");
+			fr_exit_now(EXIT_FAILURE);
+		}
+
+		if (driver_unassign_lease(&count, conf->driver, p, owner) < 0) {
+			fr_exit_now(EXIT_FAILURE);
+		}
+		INFO("Un-assigned %" PRIu64 " address(es)/prefix(es)", count);
 	}
 		continue;
 

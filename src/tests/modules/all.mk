@@ -46,9 +46,9 @@ else
   ifdef ${1}_require_test_server
     ifdef TEST_SERVER
       # define and export FOO_TEST_SERVER if it's not already defined
-      $(eval export $(shell echo ${1} | tr a-z A-Z)_TEST_SERVER ?= $(TEST_SERVER))
+      $(eval export $(toupper ${1})_TEST_SERVER ?= $(TEST_SERVER))
     endif
-    ifeq "$($(shell echo ${1} | tr a-z A-Z)_TEST_SERVER)" ""
+    ifeq "$($(toupper ${1})_TEST_SERVER)" ""
       # the module requires a test server, but we don't have one.  Skip it.
       FILES_SKIP += ${2}
     endif
@@ -79,8 +79,8 @@ $(foreach x, $(filter sql_%,$(FILES)), $(eval $$(OUTPUT.$(TEST))/$x: $(patsubst 
 #  Migration support.  Some of the tests don't run under the new
 #  conditions, so we don't run them under the new conditions.
 #
-$(foreach x, $(filter ldap% sql_%,$(FILES)), $(eval $$(OUTPUT.$(TEST))/$x: NEW_COND=-S parse_new_conditions=no -S use_new_conditions=no))
-$(foreach x, $(filter-out ldap% sql_%,$(FILES)), $(eval $$(OUTPUT.$(TEST))/$x: NEW_COND=-S parse_new_conditions=yes -S use_new_conditions=yes))
+$(foreach x, $(filter ldap% sql_%,$(FILES)), $(eval $$(OUTPUT.$(TEST))/$x: NEW_COND=-S use_new_conditions=no))
+$(foreach x, $(filter-out ldap% sql_%,$(FILES)), $(eval $$(OUTPUT.$(TEST))/$x: NEW_COND=-S use_new_conditions=yes))
 
 #
 #  Files in the output dir depend on the unit tests

@@ -12,7 +12,6 @@ env:
   ASAN_OPTIONS: symbolize=1 detect_leaks=1 detect_stack_use_after_return=1
   LSAN_OPTIONS: fast_unwind_on_malloc=0:malloc_context_size=50
   UBSAN_OPTIONS: print_stacktrace=1
-  KQUEUE_DEBUG: yes
   M_PERTURB: "0x42"
   PANIC_ACTION: "gdb -batch -x raddb/panic.gdb %e %p 1>&0 2>&0"
 # Stops the utilities forking on every call to check if they're running under GDB/LLDB
@@ -106,7 +105,7 @@ jobs:
         ports:
           - 3306:3306
         options: >-
-          --health-cmd="mysqladmin ping"
+          --health-cmd="mariadb-admin ping"
           --health-interval 10s
           --health-timeout 5s
           --health-retries 10

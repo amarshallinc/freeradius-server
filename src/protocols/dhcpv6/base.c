@@ -579,11 +579,9 @@ ssize_t	fr_dhcpv6_decode(TALLOC_CTX *ctx, fr_pair_list_t *out, uint8_t const *pa
 {
 	ssize_t			slen = -1;
 	uint8_t const		*p, *end;
-	fr_dhcpv6_decode_ctx_t	packet_ctx;
+	fr_dhcpv6_decode_ctx_t	packet_ctx = {};
 	fr_pair_t		*vp;
 	fr_pair_list_t		tmp;
-
-	fr_pair_list_init(&tmp);
 
 	if (packet_len < DHCPV6_HDR_LEN) return 0; /* protect access to packet[0] */
 
@@ -593,6 +591,7 @@ ssize_t	fr_dhcpv6_decode(TALLOC_CTX *ctx, fr_pair_list_t *out, uint8_t const *pa
 	vp = fr_pair_afrom_da(ctx, attr_packet_type);
 	if (!vp) return -1;
 
+	fr_pair_list_init(&tmp);
 	vp->vp_uint32 = packet[0];
 	fr_pair_append(&tmp, vp);
 
@@ -609,7 +608,7 @@ ssize_t	fr_dhcpv6_decode(TALLOC_CTX *ctx, fr_pair_list_t *out, uint8_t const *pa
 		 */
 		vp = fr_pair_afrom_da(ctx, attr_hop_count);
 		if (!vp) goto fail;
-		if (fr_value_box_from_network(vp, &vp->data, vp->da->type, NULL,
+		if (fr_value_box_from_network(vp, &vp->data, vp->vp_type, NULL,
 					      &FR_DBUFF_TMP(packet + 1, 1), 1, true) < 0) {
 			goto fail;
 		}
@@ -617,7 +616,7 @@ ssize_t	fr_dhcpv6_decode(TALLOC_CTX *ctx, fr_pair_list_t *out, uint8_t const *pa
 
 		vp = fr_pair_afrom_da(ctx, attr_relay_link_address);
 		if (!vp) goto fail;
-		if (fr_value_box_from_network(vp, &vp->data, vp->da->type, NULL,
+		if (fr_value_box_from_network(vp, &vp->data, vp->vp_type, NULL,
 					      &FR_DBUFF_TMP(packet + 2, 16), 16, true) < 0) {
 			goto fail;
 		}
@@ -625,7 +624,7 @@ ssize_t	fr_dhcpv6_decode(TALLOC_CTX *ctx, fr_pair_list_t *out, uint8_t const *pa
 
 		vp = fr_pair_afrom_da(ctx, attr_relay_peer_address);
 		if (!vp) goto fail;
-		if (fr_value_box_from_network(vp, &vp->data, vp->da->type, NULL,
+		if (fr_value_box_from_network(vp, &vp->data, vp->vp_type, NULL,
 					      &FR_DBUFF_TMP(packet + 2 + 16, 16), 16, true) < 0) {
 			goto fail;
 		}
@@ -704,7 +703,7 @@ void *fr_dhcpv6_next_encodable(fr_dlist_head_t *list, void *current, void *uctx)
 	while ((c = fr_dlist_next(list, c))) {
 		PAIR_VERIFY(c);
 		if (c->da->dict != dict || c->da->flags.internal) continue;
-		if (c->da->type == FR_TYPE_BOOL && !c->vp_bool) continue;
+		if (c->vp_type == FR_TYPE_BOOL && !c->vp_bool) continue;
 
 		break;
 	}
@@ -881,12 +880,11 @@ static void dhcpv6_print_hex(FILE *fp, uint8_t const *packet, size_t packet_len,
 		fprintf(fp, "%.*s", depth + 1, tabs);
 		fprintf(fp, "%04x %04x\t", fr_nbo_to_uint16(option), length);
 
-		if ((option + 4 + length) > end) {
+		if (length > end - (option + 4)) {
 			print_hex_data(fp, option + 4, end - (option + 4), depth + 3);
 			break;
 		}
 
-		/* coverity[tainted_data] */
 		print_hex_data(fp, option + 4, length, depth + 3);
 		if ((option[0] == 0) && (option[1] == attr_relay_message->attr)) {
 			dhcpv6_print_hex(fp, option + 4, length, depth + 2);

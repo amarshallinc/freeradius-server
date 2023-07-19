@@ -50,13 +50,6 @@ typedef struct fr_io_track_s {
 	bool				do_not_respond;	//!< don't respond
 	bool				finished;	//!< are we finished the request?
 
-	/*
-	 *	We can't set the "process" function here, because a
-	 *	second (conflicting) packet may arrive while we're
-	 *	processing this one.  Instead, set the timestamp of
-	 *	the packet which creates the dynamic client
-	 *	definition.
-	 */
 	fr_time_t			dynamic;	//!< timestamp for packet doing dynamic client definition
 	fr_io_address_t const  		*address;	//!< of this packet.. shared between multiple packets
 	fr_io_client_t			*client;	//!< client handling this packet.
@@ -95,8 +88,6 @@ typedef struct {
 	dl_module_inst_t		*submodule;			//!< As provided by the transport_parse
 									///< callback.  Broken out into the
 									///< app_io_* fields below for convenience.
-	dl_module_inst_t		*dynamic_submodule;		//!< for dynamically defined clients
-
 	fr_app_t			*app;				//!< main protocol handler
 	void				*app_instance;			//!< instance data for main protocol handler
 

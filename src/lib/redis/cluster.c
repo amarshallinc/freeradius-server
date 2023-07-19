@@ -154,9 +154,15 @@
 #include <freeradius-devel/util/rand.h>
 #include <freeradius-devel/util/time.h>
 
+#include "config.h"
 #include "base.h"
 #include "cluster.h"
 #include "crc16.h"
+
+#ifdef HAVE_REDIS_SSL
+#include <freeradius-devel/tls/strerror.h>
+#include <hiredis/hiredis_ssl.h>
+#endif
 
 #define KEY_SLOTS		16384			//!< Maximum number of keyslots (should not change).
 
@@ -252,6 +258,9 @@ struct fr_redis_cluster {
 
 	fr_redis_conf_t		*conf;			//!< Base configuration data such as the database number
 							//!< and passwords.
+#ifdef HAVE_REDIS_SSL
+	SSL_CTX			*ssl_ctx;		//!< SSL context.
+#endif
 
 	fr_redis_cluster_node_t	*node;			//!< Structure containing a node id, its address and
 							//!< a pool of its connections.
@@ -470,7 +479,7 @@ static fr_redis_cluster_rcode_t cluster_node_conf_from_redirect(uint16_t *key_sl
 	}
 	p++;			/* Skip the ' ' */
 
-	if (fr_inet_pton_port(&ipaddr, &port, p, redirect->len - (p - redirect->str), AF_UNSPEC, false, true) < 0) {
+	if (fr_inet_pton_port(&ipaddr, &port, p, redirect->len - (p - redirect->str), AF_UNSPEC, true, true) < 0) {
 		return FR_REDIS_CLUSTER_RCODE_BAD_INPUT;
 	}
 	fr_assert(ipaddr.af);
@@ -536,14 +545,14 @@ static fr_redis_cluster_rcode_t cluster_map_apply(fr_redis_cluster_t *cluster, r
 #  define SET_ADDR(_addr, _map) \
 do { \
 	int _ret; \
-	_ret = fr_inet_pton(&_addr.inet.dst_ipaddr, _map->element[0]->str, _map->element[0]->len, AF_UNSPEC, false, true);\
+	_ret = fr_inet_pton(&_addr.inet.dst_ipaddr, _map->element[0]->str, _map->element[0]->len, AF_UNSPEC, true, true);\
 	fr_assert(_ret == 0);\
 	_addr.inet.dst_port = _map->element[1]->integer; \
 } while (0)
 #else
 #  define SET_ADDR(_addr, _map) \
 do { \
-	fr_inet_pton(&_addr.inet.dst_ipaddr, _map->element[0]->str, _map->element[0]->len, AF_UNSPEC, false, true);\
+	fr_inet_pton(&_addr.inet.dst_ipaddr, _map->element[0]->str, _map->element[0]->len, AF_UNSPEC, true, true);\
 	_addr.inet.dst_port = _map->element[1]->integer; \
 } while (0)
 #endif
@@ -806,7 +815,7 @@ static int cluster_map_node_validate(redisReply *node, int map_idx, int node_idx
 		return FR_REDIS_CLUSTER_RCODE_BAD_INPUT;
 	}
 
-	if (fr_inet_pton(&ipaddr, node->element[0]->str, node->element[0]->len, AF_UNSPEC, false, true) < 0) {
+	if (fr_inet_pton(&ipaddr, node->element[0]->str, node->element[0]->len, AF_UNSPEC, true, true) < 0) {
 		return FR_REDIS_CLUSTER_RCODE_BAD_INPUT;
 	}
 
@@ -1472,6 +1481,31 @@ void *fr_redis_cluster_conn_create(TALLOC_CTX *ctx, void *instance, fr_time_delt
 		return NULL;
 	}
 
+	conn = talloc_zero(ctx, fr_redis_conn_t);
+	conn->handle = handle;
+	talloc_set_destructor(conn, _cluster_conn_free);
+
+#ifdef HAVE_REDIS_SSL
+	if (node->cluster->ssl_ctx != NULL) {
+		fr_tls_session_t *tls_session = fr_tls_session_alloc_client(conn, node->cluster->ssl_ctx);
+		if (!tls_session) {
+			fr_tls_strerror_printf("%s - [%i]", log_prefix, node->id);
+			ERROR("%s - [%i] Failed to allocate TLS session", log_prefix, node->id);
+			talloc_free(conn);
+			return NULL;
+		}
+
+		// redisInitiateSSL() takes ownership of SSL object on success
+		SSL_up_ref(tls_session->ssl);
+		if (redisInitiateSSL(handle, tls_session->ssl) != REDIS_OK) {
+			ERROR("%s - [%i] Failed to initiate SSL: %s", log_prefix, node->id, handle->errstr);
+			SSL_free(tls_session->ssl);
+			talloc_free(conn);
+			return NULL;
+		}
+	}
+#endif
+
 	if (node->cluster->conf->password) {
 		if (node->cluster->conf->username) {
 			DEBUG3("%s - [%i] Executing: AUTH %s %s", log_prefix, node->id,
@@ -1488,7 +1522,7 @@ void *fr_redis_cluster_conn_create(TALLOC_CTX *ctx, void *instance, fr_time_delt
 			ERROR("%s - [%i] Failed authenticating: %s", log_prefix, node->id, handle->errstr);
 		error:
 			if (reply) fr_redis_reply_free(&reply);
-			redisFree(handle);
+			talloc_free(conn);
 			return NULL;
 		}
 
@@ -1543,10 +1577,6 @@ void *fr_redis_cluster_conn_create(TALLOC_CTX *ctx, void *instance, fr_time_delt
 			goto error;
 		}
 	}
-
-	conn = talloc_zero(ctx, fr_redis_conn_t);
-	conn->handle = handle;
-	talloc_set_destructor(conn, _cluster_conn_free);
 
 	return conn;
 }
@@ -2037,8 +2067,12 @@ int fr_redis_cluster_pool_by_node_addr(fr_pool_t **pool, fr_redis_cluster_t *clu
 {
 	fr_redis_cluster_node_t	find, *found;
 
-	find.addr.inet.dst_ipaddr = node_addr->inet.dst_ipaddr;
-	find.addr.inet.dst_port = node_addr->inet.dst_port;
+	find.addr = (fr_socket_t) {
+		.inet = {
+			.dst_ipaddr = node_addr->inet.dst_ipaddr,
+			.dst_port = node_addr->inet.dst_port,
+		}
+	};
 
 	pthread_mutex_lock(&cluster->mutex);
 	found = fr_rb_find(cluster->used_nodes, &find);
@@ -2063,7 +2097,6 @@ int fr_redis_cluster_pool_by_node_addr(fr_pool_t **pool, fr_redis_cluster_t *clu
 			pthread_mutex_unlock(&cluster->mutex);
 			return -1;
 		}
-		/* coverity[uninit_use] */
 		spare->pending_addr = find.addr;	/* Set the config to be applied */
 		if (cluster_node_connect(cluster, spare) < 0) {
 			pthread_mutex_unlock(&cluster->mutex);
@@ -2286,6 +2319,37 @@ fr_redis_cluster_t *fr_redis_cluster_alloc(TALLOC_CTX *ctx,
 		(void) cf_section_alloc(module, module, "pool", NULL);
 	}
 
+	/*
+	 *	Parse TLS configuration
+	 */
+	if (conf->use_tls) {
+#ifdef HAVE_REDIS_SSL
+		CONF_SECTION *tls_cs;
+		fr_tls_conf_t *tls_conf;
+
+		tls_cs = cf_section_find(module, "tls", NULL);
+		if (!tls_cs) {
+			tls_cs = cf_section_alloc(module, module, "tls", NULL);
+		}
+
+		tls_conf = fr_tls_conf_parse_client(tls_cs);
+		if (!tls_conf) {
+			ERROR("%s - Failed to parse TLS configuation", cluster->log_prefix);
+			talloc_free(cluster);
+			return NULL;
+		}
+
+		cluster->ssl_ctx = fr_tls_ctx_alloc(tls_conf, true);
+		if (!cluster->ssl_ctx) {
+			ERROR("%s - Failed to allocate SSL context", cluster->log_prefix);
+			talloc_free(cluster);
+			return NULL;
+		}
+#else
+		WARN("%s - No redis SSL support, ignoring \"use_tls = yes\"", cluster->log_prefix);
+#endif
+	}
+
 	if (conf->max_nodes == UINT8_MAX) {
 		ERROR("%s - Maximum number of connected nodes allowed is %i", cluster->log_prefix, UINT8_MAX - 1);
 		talloc_free(cluster);
@@ -2420,6 +2484,11 @@ fr_redis_cluster_t *fr_redis_cluster_alloc(TALLOC_CTX *ctx,
 			}
 		} else {
 			break;
+		}
+
+		if (!cluster->conf->use_cluster_map) {
+			fr_pool_connection_release(node->pool, NULL, conn);
+			continue;
 		}
 
 		switch (cluster_map_get(&map, conn)) {

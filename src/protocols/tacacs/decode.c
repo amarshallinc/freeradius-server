@@ -374,7 +374,7 @@ static int tacacs_decode_field(TALLOC_CTX *ctx, fr_pair_list_t *out, fr_dict_att
 	uint8_t const *p = *field_data;
 	fr_pair_t *vp;
 
-	if ((p + field_len) > end) {
+	if (field_len > (end - p)) {
 		fr_strerror_printf("'%s' length %u overflows the remaining data (%zu) in the packet",
 				   da->name, field_len, end - p);
 		return -1;
@@ -553,17 +553,17 @@ ssize_t fr_tacacs_decode(TALLOC_CTX *ctx, fr_pair_list_t *out, fr_dict_attr_t co
 
 		FR_PROTO_HEX_DUMP(decrypted, buffer_len, "fr_tacacs_packet_t (unencrypted)");
 
-		if (code) {
-			*code = fr_tacacs_packet_to_code((fr_tacacs_packet_t const *) decrypted);
-			if (*code < 0) goto fail;
-		}
-
 		buffer = decrypted;
 	}
 
 #ifndef NDEBUG
-	if (fr_debug_lvl >= L_DBG_LVL_4) fr_tacacs_packet_log_hex(&default_log, pkt);
+	if (fr_debug_lvl >= L_DBG_LVL_4) fr_tacacs_packet_log_hex(&default_log, pkt, (end - buffer));
 #endif
+
+	if (code) {
+		*code = fr_tacacs_packet_to_code((fr_tacacs_packet_t const *) buffer);
+		if (*code < 0) goto fail;
+	}
 
 	switch (pkt->hdr.type) {
 	case FR_TAC_PLUS_AUTHEN:
@@ -623,12 +623,15 @@ ssize_t fr_tacacs_decode(TALLOC_CTX *ctx, fr_pair_list_t *out, fr_dict_attr_t co
 			DECODE_FIELD_UINT8(attr_tacacs_authentication_service, pkt->authen_start.authen_service);
 
 			/*
-			 *	Decode 4 fields, based on their "length"
+			 *	Decode 3 fields, based on their "length"
+			 *	user and rem_addr are optional - indicated by zero length
 			 */
 			p = body;
-			DECODE_FIELD_STRING8(attr_tacacs_user_name, pkt->authen_start.user_len);
+			if (pkt->authen_start.user_len > 0) DECODE_FIELD_STRING8(attr_tacacs_user_name,
+										 pkt->authen_start.user_len);
 			DECODE_FIELD_STRING8(attr_tacacs_client_port, pkt->authen_start.port_len);
-			DECODE_FIELD_STRING8(attr_tacacs_remote_address, pkt->authen_start.rem_addr_len);
+			if (pkt->authen_start.rem_addr_len > 0) DECODE_FIELD_STRING8(attr_tacacs_remote_address,
+										     pkt->authen_start.rem_addr_len);
 
 			/*
 			 *	Check the length on the various
@@ -862,11 +865,13 @@ ssize_t fr_tacacs_decode(TALLOC_CTX *ctx, fr_pair_list_t *out, fr_dict_attr_t co
 
 			/*
 			 *	Decode 3 fields, based on their "length"
+			 *	rem_addr is optional - indicated by zero length
 			 */
 			p = body;
 			DECODE_FIELD_STRING8(attr_tacacs_user_name, pkt->author_req.user_len);
 			DECODE_FIELD_STRING8(attr_tacacs_client_port, pkt->author_req.port_len);
-			DECODE_FIELD_STRING8(attr_tacacs_remote_address, pkt->author_req.rem_addr_len);
+			if (pkt->author_req.rem_addr_len > 0) DECODE_FIELD_STRING8(attr_tacacs_remote_address,
+										   pkt->author_req.rem_addr_len);
 
 			/*
 			 *	Decode 'arg_N' arguments (horrible format)

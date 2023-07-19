@@ -165,7 +165,6 @@ static void da_print_info_td(fr_dict_t const *dict, fr_dict_attr_t const *da)
 	fr_dict_attr_flags_print(&FR_SBUFF_OUT(flags, sizeof(flags)), dict, da->type, &da->flags);
 
 	/* Protocol Name Type */
-	/* coverity[uninit_use_in_call] */
 
 	switch(output_format) {
 		case RADICT_OUT_CSV:
@@ -264,11 +263,12 @@ static void _raddict_export(fr_dict_t const *dict, uint64_t *count, uintptr_t *l
 	 *	Todo - Should be fixed to use attribute walking API
 	 */
 	children = dict_attr_children(da);
-	len = talloc_array_length(children);
-	for (i = 0; i < len; i++) {
-		/* coverity[dereference] */
-		for (p = children[i]; p; p = p->next) {
-			_raddict_export(dict, count, low, high, p, lvl + 1);
+	if (children) {
+		len = talloc_array_length(children);
+		for (i = 0; i < len; i++) {
+			for (p = children[i]; p; p = p->next) {
+				_raddict_export(dict, count, low, high, p, lvl + 1);
+			}
 		}
 	}
 }

@@ -214,7 +214,12 @@ static int mod_decode(UNUSED void const *instance, request_t *request, uint8_t *
 
 	client = address->radclient;
 
-	if (fr_radius_verify(data, NULL, (uint8_t const *) client->secret, talloc_array_length(client->secret) - 1,
+	/*
+	 *	!client->active means a fake packet defining a dynamic client - so there will
+	 *	be no secret defined yet - so can't verify.
+	 */
+	if (client->active &&
+	    fr_radius_verify(data, NULL, (uint8_t const *) client->secret, talloc_array_length(client->secret) - 1,
 			     client->message_authenticator) < 0) {
 		RPEDEBUG("Failed verifying packet signature.");
 		return -1;
@@ -264,11 +269,13 @@ static int mod_decode(UNUSED void const *instance, request_t *request, uint8_t *
 
 		fr_assert(client->dynamic);
 
+		request_set_dynamic_client(request);
+
 		for (vp = fr_pair_list_head(&request->request_pairs);
 		     vp != NULL;
 		     vp = fr_pair_list_next(&request->request_pairs, vp)) {
 			if (!flag_encrypted(&vp->da->flags)) {
-				switch (vp->da->type) {
+				switch (vp->vp_type) {
 				default:
 					break;
 

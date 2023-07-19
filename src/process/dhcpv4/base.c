@@ -125,17 +125,24 @@ typedef struct {
 	CONF_SECTION	*lease_unknown;
 	CONF_SECTION	*lease_active;
 	CONF_SECTION	*do_not_respond;
+
+	CONF_SECTION	*new_client;
+	CONF_SECTION	*add_client;
+	CONF_SECTION	*deny_client;
 } process_dhcpv4_sections_t;
 
 typedef struct {
 	process_dhcpv4_sections_t sections;
 } process_dhcpv4_t;
 
+#define FR_DHCP_PROCESS_CODE_VALID(_x) (FR_DHCP_PACKET_CODE_VALID(_x) || (_x == FR_DHCP_DO_NOT_RESPOND))
+
 #define PROCESS_PACKET_TYPE		fr_dhcpv4_packet_code_t
 #define PROCESS_CODE_MAX		FR_DHCP_CODE_MAX
 #define PROCESS_CODE_DO_NOT_RESPOND	FR_DHCP_DO_NOT_RESPOND
-#define PROCESS_PACKET_CODE_VALID	FR_DHCP_PACKET_CODE_VALID
+#define PROCESS_PACKET_CODE_VALID	FR_DHCP_PROCESS_CODE_VALID
 #define PROCESS_INST			process_dhcpv4_t
+#define PROCESS_CODE_DYNAMIC_CLIENT	FR_DHCP_ACK
 #include <freeradius-devel/server/process.h>
 
 RESUME(check_yiaddr)
@@ -207,6 +214,25 @@ static fr_process_state_t const process_state[] = {
 		.resume = resume_recv_generic,
 		.section_offset = PROCESS_CONF_OFFSET(request),
 	},
+	[FR_DHCP_DECLINE] = {
+		.packet_type = {
+			[RLM_MODULE_OK] =	FR_DHCP_DO_NOT_RESPOND,
+			[RLM_MODULE_NOOP] =	FR_DHCP_DO_NOT_RESPOND,
+			[RLM_MODULE_UPDATED] =	FR_DHCP_DO_NOT_RESPOND,
+
+			[RLM_MODULE_REJECT] =  	FR_DHCP_DO_NOT_RESPOND,
+			[RLM_MODULE_FAIL] =	FR_DHCP_DO_NOT_RESPOND,
+			[RLM_MODULE_INVALID] =	FR_DHCP_DO_NOT_RESPOND,
+			[RLM_MODULE_DISALLOW] =	FR_DHCP_DO_NOT_RESPOND,
+			[RLM_MODULE_NOTFOUND] =	FR_DHCP_DO_NOT_RESPOND,
+		},
+		.rcode = RLM_MODULE_NOOP,
+		.default_reply = FR_DHCP_DO_NOT_RESPOND,
+		.recv = recv_generic,
+		.resume = resume_recv_generic,
+		.section_offset = PROCESS_CONF_OFFSET(request),
+	},
+
 	[FR_DHCP_ACK] = {
 		.packet_type = {
 			[RLM_MODULE_OK] =	FR_DHCP_ACK,
@@ -393,7 +419,16 @@ static unlang_action_t mod_process(rlm_rcode_t *p_result, module_ctx_t const *mc
 
 	UPDATE_STATE(packet);
 
+	if (!state->recv) {
+		REDEBUG("Invalid packet type (%u)", request->packet->code);
+		RETURN_MODULE_FAIL;
+	}
+
 	dhcpv4_packet_debug(request, request->packet, &request->request_pairs, true);
+
+	if (unlikely(request_is_dynamic_client(request))) {
+		return new_client(p_result, mctx, request);
+	}
 
 	return state->recv(p_result, mctx, request);
 }
@@ -513,6 +548,8 @@ static const virtual_server_compile_t compile_list[] = {
 		.component = MOD_POST_AUTH,
 		.offset = PROCESS_CONF_OFFSET(do_not_respond),
 	},
+
+	DYNAMIC_CLIENT_SECTIONS,
 
 	COMPILE_TERMINATOR
 };

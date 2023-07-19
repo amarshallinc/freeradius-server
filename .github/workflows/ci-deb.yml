@@ -36,8 +36,9 @@ jobs:
           {
             "env": [
               { "NAME": "ubuntu-20.04", "OS": "ubuntu:20.04"    },
-              { "NAME": "debian-10",    "OS": "debian:buster"   },
+              { "NAME": "ubuntu-22.04", "OS": "ubuntu:22.04"    },
               { "NAME": "debian-11",    "OS": "debian:bullseye" },
+              { "NAME": "debian-12",    "OS": "debian:bookworm" },
               { "NAME": "debian-sid",   "OS": "debian:sid"      }
             ]
           }
@@ -111,7 +112,7 @@ jobs:
         if [ "$RELEASE" = "n/a" ]; then
             RELEASE=$(cat /etc/debian_version | awk -F \/ '{ print $(NF) }')
         fi
-        [ "$RELEASE" != "bookworm" ] || RELEASE=sid
+        [ "$RELEASE" != "trixie" ] || RELEASE=sid
         echo "deb http://packages.networkradius.com/extras/${DIST}/${RELEASE} ${RELEASE} main" \
           > /etc/apt/sources.list.d/networkradius-extras.list
 
@@ -233,7 +234,7 @@ jobs:
         if [ "$RELEASE" = "n/a" ]; then
             RELEASE=$(cat /etc/debian_version | awk -F \/ '{ print $(NF) }')
         fi
-        [ "$RELEASE" != "bookworm" ] || RELEASE=sid
+        [ "$RELEASE" != "trixie" ] || RELEASE=sid
         echo "deb http://packages.networkradius.com/extras/${DIST}/${RELEASE} ${RELEASE} main" \
           > /etc/apt/sources.list.d/networkradius-extras.list
 

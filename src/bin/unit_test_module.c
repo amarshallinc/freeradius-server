@@ -31,6 +31,8 @@ RCSID("$Id$")
 #include <freeradius-devel/util/debug.h>
 #include <freeradius-devel/util/rand.h>
 #include <freeradius-devel/util/value.h>
+#include <freeradius-devel/util/strerror.h>
+#include <freeradius-devel/util/sbuff.h>
 #include <freeradius-devel/io/listen.h>
 
 #include <freeradius-devel/tls/base.h>
@@ -308,7 +310,6 @@ static void print_packet(FILE *fp, fr_radius_packet_t *packet, fr_pair_list_t *l
 	fr_pair_list_log(&default_log, 2, list);
 }
 
-
 /*
  *	Read a file compose of xlat's and expected results
  */
@@ -316,10 +317,23 @@ static bool do_xlats(fr_event_list_t *el, char const *filename, FILE *fp)
 {
 	int		lineno = 0;
 	ssize_t		len;
-	char		*p;
-	char		input[8192];
-	char		output[8192];
+	char		line_buff[8192];
+	char		output_buff[8192];
+	char		unescaped[sizeof(output_buff)];
 	request_t	*request;
+	fr_sbuff_t	line;
+	fr_sbuff_t	out = FR_SBUFF_OUT(output_buff, sizeof(output_buff));
+
+	static fr_sbuff_escape_rules_t unprintables = {
+		.name = "unprintables",
+		.chr = '\\',
+		.esc = {
+			SBUFF_CHAR_UNPRINTABLES_LOW,
+			SBUFF_CHAR_UNPRINTABLES_EXTENDED
+		},
+		.do_utf8 = true,
+		.do_oct = true
+	};
 
 	/*
 	 *	Create and initialize the new request.
@@ -360,66 +374,67 @@ static bool do_xlats(fr_event_list_t *el, char const *filename, FILE *fp)
 
 	request->master_state = REQUEST_ACTIVE;
 	request->log.lvl = fr_debug_lvl;
-	output[0] = '\0';
-
 	request->async = talloc_zero(request, fr_async_t);
 
-	while (fgets(input, sizeof(input), fp) != NULL) {
+	while (fgets(line_buff, sizeof(line_buff), fp) != NULL) {
 		lineno++;
 
-		/*
-		 *	Ignore blank lines and comments
-		 */
-		p = input;
-		fr_skip_whitespace(p);
-
-		if (*p < ' ') continue;
-		if (*p == '#') continue;
-
-		p = strchr(p, '\n');
-		if (!p) {
+		line = FR_SBUFF_IN(line_buff, sizeof(line_buff));
+		fr_sbuff_set_to_start(&out);
+		if (!fr_sbuff_adv_to_chr(&line, SIZE_MAX, '\n')) {
 			if (!feof(fp)) {
-				fprintf(stderr, "Line %d too long in %s\n",
-					lineno, filename);
+				fprintf(stderr, "%s[%d] Line too long\n", filename, lineno);
 				TALLOC_FREE(request);
 				return false;
 			}
 		} else {
-			*p = '\0';
+			fr_sbuff_terminate(&line);
 		}
+		line.end = line.p;
+		fr_sbuff_set_to_start(&line);
+
+		/*
+		 *	Ignore blank lines and comments
+		 */
+		fr_sbuff_adv_past_whitespace(&line, SIZE_MAX, NULL);
+
+		if (*fr_sbuff_current(&line) < ' ') continue;
+		if (fr_sbuff_is_char(&line, '#')) continue;
 
 		/*
 		 *	Look for "xlat"
 		 */
-		if (strncmp(input, "xlat ", 5) == 0) {
+		if (fr_sbuff_adv_past_str_literal(&line, "xlat ") > 0) {
 			ssize_t			slen;
 			TALLOC_CTX		*xlat_ctx = talloc_init_const("xlat");
-			char			*fmt = talloc_typed_strdup(xlat_ctx, input + 5);
 			xlat_exp_head_t		*head = NULL;
 			fr_sbuff_parse_rules_t	p_rules = { .escapes = &fr_value_unescape_double };
 
-			slen = xlat_tokenize_ephemeral(xlat_ctx, &head, el,
-						       &FR_SBUFF_IN(fmt, talloc_array_length(fmt) - 1), &p_rules, NULL);
+			slen = xlat_tokenize_ephemeral(xlat_ctx, &head, el, &line, &p_rules, NULL);
 			if (slen <= 0) {
 				talloc_free(xlat_ctx);
-				snprintf(output, sizeof(output), "ERROR offset %d '%s'", (int) -slen,
-					 fr_strerror());
+				fr_sbuff_in_sprintf(&out, "ERROR offset %d '%s'", (int) -slen, fr_strerror());
 				continue;
 			}
 
-			if (input[slen + 5] != '\0') {
+			if (fr_sbuff_remaining(&line) > 0) {
 				talloc_free(xlat_ctx);
-				snprintf(output, sizeof(output), "ERROR offset %d 'Too much text' ::%s::",
-					 (int) slen, input + slen + 5);
+				fr_sbuff_in_sprintf(&out,  "ERROR offset %d 'Too much text' ::%s::", (int) slen, fr_sbuff_current(&line));
 				continue;
 			}
 
-			len = xlat_eval_compiled(output, sizeof(output), request, head, NULL, NULL);
+			len = xlat_eval_compiled(unescaped, sizeof(unescaped), request, head, NULL, NULL);
 			if (len < 0) {
+				char const *err = fr_strerror();
 				talloc_free(xlat_ctx);
-				snprintf(output, sizeof(output), "ERROR expanding xlat: %s", fr_strerror());
+				fr_sbuff_in_sprintf(&out, "ERROR expanding xlat: %s", *err ? err : "no error provided");
 				continue;
 			}
+
+			/*
+			 *	Escape the output as if it were a double quoted string.
+			 */
+			fr_sbuff_in_escape(&out, unescaped, len, &unprintables);
 
 			TALLOC_FREE(xlat_ctx); /* also frees 'head' */
 			continue;
@@ -428,14 +443,13 @@ static bool do_xlats(fr_event_list_t *el, char const *filename, FILE *fp)
 		/*
 		 *	Look for "xlat_expr"
 		 */
-		if (strncmp(input, "xlat_expr ", 10) == 0) {
+		if (fr_sbuff_adv_past_str_literal(&line, "xlat_expr ") > 0) {
 			ssize_t			slen;
 			TALLOC_CTX		*xlat_ctx = talloc_init_const("xlat");
-			char			*fmt = talloc_typed_strdup(xlat_ctx, input + 10);
 			xlat_exp_head_t		*head = NULL;
 
 			slen = xlat_tokenize_ephemeral_expression(xlat_ctx, &head, el,
-								  &FR_SBUFF_IN(fmt, talloc_array_length(fmt) - 1),
+								  &line,
 								  NULL,
 								  &(tmpl_rules_t) {
 									  .attr = {
@@ -447,30 +461,34 @@ static bool do_xlats(fr_event_list_t *el, char const *filename, FILE *fp)
 								);
 			if (slen <= 0) {
 				talloc_free(xlat_ctx);
-				snprintf(output, sizeof(output), "ERROR offset %d '%s'", (int) -slen,
-					 fr_strerror());
+				fr_sbuff_in_sprintf(&out, "ERROR offset %d '%s'", (int) -slen, fr_strerror());
 				continue;
 			}
 
-			if (input[slen + 10] != '\0') {
+			if (fr_sbuff_remaining(&line) > 0) {
 				talloc_free(xlat_ctx);
-				snprintf(output, sizeof(output), "ERROR offset %d Unexpected text '%s' after parsing",
-					 (int) slen, input + slen + 10);
+				fr_sbuff_in_sprintf(&out, "ERROR offset %d 'Too much text' ::%s::", (int) slen, fr_sbuff_current(&line));
 				continue;
 			}
 
 			if (xlat_resolve(head, NULL) < 0) {
 				talloc_free(xlat_ctx);
-				snprintf(output, sizeof(output), "ERROR resolving xlat: %s", fr_strerror());
+				fr_sbuff_in_sprintf(&out, "ERROR resolving xlat: %s", fr_strerror());
 				continue;
 			}
 
-			len = xlat_eval_compiled(output, sizeof(output), request, head, NULL, NULL);
+			len = xlat_eval_compiled(unescaped, sizeof(unescaped), request, head, NULL, NULL);
 			if (len < 0) {
+				char const *err = fr_strerror();
 				talloc_free(xlat_ctx);
-				snprintf(output, sizeof(output), "ERROR expanding xlat: %s", fr_strerror());
+				fr_sbuff_in_sprintf(&out, "ERROR expanding xlat: %s", *err ? err : "no error provided");
 				continue;
 			}
+
+			/*
+			 *	Escape the output as if it were a double quoted string.
+			 */
+			fr_sbuff_in_escape(&out, unescaped, len, &unprintables);
 
 			TALLOC_FREE(xlat_ctx); /* also frees 'head' */
 			continue;
@@ -479,10 +497,11 @@ static bool do_xlats(fr_event_list_t *el, char const *filename, FILE *fp)
 		/*
 		 *	Look for "match".
 		 */
-		if (strncmp(input, "match ", 6) == 0) {
-			if (strcmp(input + 6, output) != 0) {
-				fprintf(stderr, "Mismatch at line %d of %s\n\tgot      : %s\n\texpected : %s\n",
-					lineno, filename, output, input + 6);
+		if (fr_sbuff_adv_past_str_literal(&line, "match ") > 0) {
+			size_t output_len = strlen(output_buff);
+			if (!fr_sbuff_is_str(&line, output_buff, output_len) && (output_len != fr_sbuff_remaining(&line))) {
+				fprintf(stderr, "Mismatch at %s[%u]\n\tgot          : %s (%zu)\n\texpected     : %s (%zu)\n",
+					filename, lineno,  output_buff, output_len, fr_sbuff_current(&line), fr_sbuff_remaining(&line));
 				TALLOC_FREE(request);
 				return false;
 			}
@@ -513,10 +532,11 @@ static int map_proc_verify(CONF_SECTION *cs, UNUSED void *mod_inst, UNUSED void 
 	return 0;
 }
 
-static rlm_rcode_t mod_map_proc(UNUSED void *mod_inst, UNUSED void *proc_inst, UNUSED request_t *request,
-			      	UNUSED fr_value_box_list_t *src, UNUSED map_list_t const *maps)
+static unlang_action_t mod_map_proc(rlm_rcode_t *p_result, UNUSED void *mod_inst, UNUSED void *proc_inst,
+				    UNUSED request_t *request, UNUSED fr_value_box_list_t *src,
+				    UNUSED map_list_t const *maps)
 {
-	return RLM_MODULE_FAIL;
+	RETURN_MODULE_FAIL;
 }
 
 static request_t *request_clone(request_t *old, int number, CONF_SECTION *server_cs)
@@ -1113,6 +1133,13 @@ cleanup:
 	unlang_free_global();
 
 	/*
+	 *	Virtual servers need to be freed before modules
+	 *	as state entries containing data with module-specific
+	 *	destructors may exist.
+	 */
+	virtual_servers_free();
+
+	/*
 	 *	Free modules, this needs to be done explicitly
 	 *	because some libraries used by modules use atexit
 	 *	handlers registered after ours, and they may deinit
@@ -1120,11 +1147,6 @@ cleanup:
 	 *	crashes on exit.
 	 */
 	modules_rlm_free();
-
-	/*
-	 *	Same with virtual servers and proto modules.
-	 */
-	virtual_servers_free();
 
 	/*
 	 *	And now nothing should be left anywhere except the

@@ -151,15 +151,19 @@ build/autoconf.mk: src/include/autoconf.h
           ifeq "$(wildcard build/lib/.libs/libfreeradius-make-version.${BUILD_LIB_EXT})" ""
             BUILD_MAKE_LIBS=yes
           endif
+          ifeq "$(wildcard build/lib/.libs/libfreeradius-make-util.${BUILD_LIB_EXT})" ""
+            BUILD_MAKE_LIBS=yes
+          endif
 
           ifdef BUILD_MAKE_LIBS
             define n
           endef
-          $(info $(subst CC,$nCC,$(shell $(MAKE) VERBOSE=$(VERBOSE) libfreeradius-make-dlopen.${BUILD_LIB_EXT} libfreeradius-make-version.${BUILD_LIB_EXT})))
+          $(info $(subst CC,$nCC,$(shell $(MAKE) VERBOSE=$(VERBOSE) libfreeradius-make-dlopen.${BUILD_LIB_EXT} libfreeradius-make-version.${BUILD_LIB_EXT} libfreeradius-make-util.${BUILD_LIB_EXT})))
         endif
 
         load build/lib/.libs/libfreeradius-make-dlopen.${BUILD_LIB_EXT}(dlopen_gmk_setup)
         load build/lib/.libs/libfreeradius-make-version.${BUILD_LIB_EXT}(version_gmk_setup)
+        load build/lib/.libs/libfreeradius-make-util.${BUILD_LIB_EXT}(util_gmk_setup)
       else
         BUILD_DIR:=${top_srcdir}/build
         top_builddir:=${top_srcdir}/scripts/build
@@ -510,7 +514,7 @@ rpmbuild/SOURCES/freeradius-server-$(PKG_VERSION).tar.bz2: freeradius-server-$(P
 	@cp $< $@
 
 rpm: rpmbuild/SOURCES/freeradius-server-$(PKG_VERSION).tar.bz2
-	@if ! $(SUDO) yum-builddep -q -C --assumeno redhat/freeradius.spec 1> rpmbuild/builddep.log 2>&1; then \
+	@if ! $(SUDO) yum-builddep ${YUM_BUILDDEP_FLAGS} -q -C --assumeno redhat/freeradius.spec 1> rpmbuild/builddep.log 2>&1; then \
 		echo "ERROR: Required dependencies not found, install them with: yum-builddep redhat/freeradius.spec"; \
 		cat rpmbuild/builddep.log; \
 		exit 1; \

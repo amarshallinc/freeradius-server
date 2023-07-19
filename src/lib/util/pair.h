@@ -234,11 +234,11 @@ do { \
  */
 static inline bool vp_da_data_type_check(fr_pair_t *vp)
 {
-	if (vp->data.type == vp->da->type) return true;
+	if (vp->vp_type == vp->da->type) return true;
 
 	fr_strerror_printf("fr_pair_t attribute %p \"%s\" data type (%s) does not match da type (%s)",
 			   vp->da, vp->da->name,
-			   fr_table_str_by_value(fr_type_table, vp->data.type, "invalid"),
+			   fr_table_str_by_value(fr_type_table, vp->vp_type, "invalid"),
 			   fr_table_str_by_value(fr_type_table, vp->da->type, "invalid"));
 	return false;
 }
@@ -438,6 +438,10 @@ int		fr_pair_reinit_from_da(fr_pair_list_t *list, fr_pair_t *vp, fr_dict_attr_t 
 
 fr_pair_t	*fr_pair_afrom_child_num(TALLOC_CTX *ctx, fr_dict_attr_t const *parent, unsigned int attr) CC_HINT(warn_unused_result);
 
+fr_pair_t	*fr_pair_afrom_da_nested(TALLOC_CTX *ctx, fr_pair_list_t *list, fr_dict_attr_t const *da) CC_HINT(warn_unused_result) CC_HINT(nonnull(2,3));
+
+fr_pair_t	*fr_pair_afrom_da_depth_nested(TALLOC_CTX *ctx, fr_pair_list_t *list, fr_dict_attr_t const *da, int start) CC_HINT(warn_unused_result) CC_HINT(nonnull(2,3));
+
 fr_pair_t	*fr_pair_copy(TALLOC_CTX *ctx, fr_pair_t const *vp) CC_HINT(nonnull(2)) CC_HINT(warn_unused_result);
 
 int		fr_pair_steal(TALLOC_CTX *ctx, fr_pair_t *vp) CC_HINT(nonnull);
@@ -464,12 +468,6 @@ fr_pair_t	*fr_pair_find_by_da_idx(fr_pair_list_t const *list,
 
 fr_pair_t	*fr_pair_find_by_da_nested(fr_pair_list_t const *list, fr_pair_t const *prev,
 					   fr_dict_attr_t const *da) CC_HINT(nonnull(1,3));
-
-fr_pair_t	*fr_pair_find_by_ancestor(fr_pair_list_t const *list, fr_pair_t const *prev,
-					  fr_dict_attr_t const *ancestor) CC_HINT(nonnull(1,3));
-
-fr_pair_t	*fr_pair_find_by_ancestor_idx(fr_pair_list_t const *list,
-					      fr_dict_attr_t const *ancestor, unsigned int idx) CC_HINT(nonnull);
 
 fr_pair_t	*fr_pair_find_by_child_num(fr_pair_list_t const *list, fr_pair_t const *prev,
 					   fr_dict_attr_t const *parent, unsigned int attr) CC_HINT(nonnull(1,3));
@@ -501,8 +499,8 @@ int		fr_pair_prepend_by_da(TALLOC_CTX *ctx, fr_pair_t **out, fr_pair_list_t *lis
 int		fr_pair_append_by_da_parent(TALLOC_CTX *ctx, fr_pair_t **out, fr_pair_list_t *list,
 					    fr_dict_attr_t const *da) CC_HINT(nonnull(3,4));
 
-int		fr_pair_update_by_da(TALLOC_CTX *ctx, fr_pair_t **out, fr_pair_list_t *list,
-				     fr_dict_attr_t const *da, unsigned int n) CC_HINT(nonnull(3,4));
+int		fr_pair_update_by_da_parent(fr_pair_t *parent, fr_pair_t **out,
+					    fr_dict_attr_t const *da) CC_HINT(nonnull(1,3));
 
 int		fr_pair_delete_by_da(fr_pair_list_t *head, fr_dict_attr_t const *da) CC_HINT(nonnull);
 
@@ -642,7 +640,7 @@ int		fr_pair_list_copy_by_da(TALLOC_CTX *ctx, fr_pair_list_t *to,
 
 int		fr_pair_list_copy_by_ancestor(TALLOC_CTX *ctx, fr_pair_list_t *to,
 					      fr_pair_list_t const *from,
-					      fr_dict_attr_t const *parent_da, unsigned int count) CC_HINT(nonnull);
+					      fr_dict_attr_t const *parent_da) CC_HINT(nonnull);
 
 int		fr_pair_sublist_copy(TALLOC_CTX *ctx, fr_pair_list_t *to,
 				     fr_pair_list_t const *from,

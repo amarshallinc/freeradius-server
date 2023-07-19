@@ -23,10 +23,11 @@
  * @copyright 2002,2006-2007 The FreeRADIUS server project
  * @copyright 2002 Alan DeKok (aland@freeradius.org)
  */
-#include "lib/unlang/xlat.h"
+
 RCSID("$Id$")
 
 #include <freeradius-devel/server/cf_file.h>
+#include <freeradius-devel/server/cf_util.h>
 #include <freeradius-devel/server/client.h>
 #include <freeradius-devel/server/cond.h>
 #include <freeradius-devel/server/dependency.h>
@@ -37,6 +38,8 @@ RCSID("$Id$")
 #include <freeradius-devel/server/util.h>
 #include <freeradius-devel/server/virtual_servers.h>
 
+#include <freeradius-devel/unlang/xlat.h>
+
 #include <freeradius-devel/util/conf.h>
 #include <freeradius-devel/util/debug.h>
 #include <freeradius-devel/util/dict.h>
@@ -44,6 +47,8 @@ RCSID("$Id$")
 #include <freeradius-devel/util/hw.h>
 #include <freeradius-devel/util/perm.h>
 #include <freeradius-devel/util/sem.h>
+#include <freeradius-devel/util/token.h>
+#include <freeradius-devel/util/pair_legacy.h>
 
 #include <freeradius-devel/unlang/xlat_func.h>
 
@@ -85,6 +90,8 @@ static int hostname_lookups_parse(TALLOC_CTX *ctx, void *out, void *parent, CONF
 
 static int num_networks_parse(TALLOC_CTX *ctx, void *out, void *parent, CONF_ITEM *ci, CONF_PARSER const *rule);
 static int num_workers_parse(TALLOC_CTX *ctx, void *out, void *parent, CONF_ITEM *ci, CONF_PARSER const *rule);
+static int num_workers_dflt(CONF_PAIR **out, void *parent, CONF_SECTION *cs, fr_token_t quote, CONF_PARSER const *rule);
+
 static int lib_dir_on_read(TALLOC_CTX *ctx, void *out, void *parent, CONF_ITEM *ci, CONF_PARSER const *rule);
 
 static int talloc_pool_size_parse(TALLOC_CTX *ctx, void *out, void *parent, CONF_ITEM *ci, CONF_PARSER const *rule);
@@ -165,7 +172,7 @@ static const CONF_PARSER thread_config[] = {
 	{ FR_CONF_OFFSET("num_networks", FR_TYPE_UINT32, main_config_t, max_networks), .dflt = STRINGIFY(1),
 	  .func = num_networks_parse },
 	{ FR_CONF_OFFSET("num_workers", FR_TYPE_UINT32, main_config_t, max_workers), .dflt = STRINGIFY(0),
-	  .func = num_workers_parse },
+	  .func = num_workers_parse, .dflt_func = num_workers_dflt },
 
 	{ FR_CONF_OFFSET("stats_interval", FR_TYPE_TIME_DELTA | FR_TYPE_HIDDEN, main_config_t, stats_interval), },
 
@@ -183,12 +190,12 @@ static const CONF_PARSER thread_config[] = {
 static const CONF_PARSER migrate_config[] = {
 	{ FR_CONF_OFFSET("unflatten_after_decode", FR_TYPE_BOOL | FR_TYPE_HIDDEN, main_config_t, unflatten_after_decode) },
 	{ FR_CONF_OFFSET("unflatten_before_encode", FR_TYPE_BOOL | FR_TYPE_HIDDEN, main_config_t, unflatten_before_encode) },
-	{ FR_CONF_OFFSET("flatten_before_encode", FR_TYPE_BOOL | FR_TYPE_HIDDEN, main_config_t, flatten_before_encode) },
 	{ FR_CONF_OFFSET("tmpl_tokenize_all_nested", FR_TYPE_BOOL | FR_TYPE_HIDDEN, main_config_t, tmpl_tokenize_all_nested) },
-	{ FR_CONF_OFFSET("parse_new_conditions", FR_TYPE_BOOL | FR_TYPE_HIDDEN, main_config_t, parse_new_conditions) },
 	{ FR_CONF_OFFSET("use_new_conditions", FR_TYPE_BOOL | FR_TYPE_HIDDEN, main_config_t, use_new_conditions) },
 	{ FR_CONF_OFFSET("rewrite_update", FR_TYPE_BOOL | FR_TYPE_HIDDEN, main_config_t, rewrite_update) },
 	{ FR_CONF_OFFSET("forbid_update", FR_TYPE_BOOL | FR_TYPE_HIDDEN, main_config_t, forbid_update) },
+	{ FR_CONF_POINTER("pair_legacy_nested", FR_TYPE_BOOL | FR_TYPE_HIDDEN, &fr_pair_legacy_nested), },
+
 	CONF_PARSER_TERMINATOR
 };
 
@@ -419,12 +426,10 @@ static int num_networks_parse(TALLOC_CTX *ctx, void *out, void *parent,
 	return 0;
 }
 
-static int num_workers_parse(TALLOC_CTX *ctx, void *out, void *parent,
-			     CONF_ITEM *ci, CONF_PARSER const *rule)
+static int num_workers_parse(TALLOC_CTX *ctx, void *out, void *parent, CONF_ITEM *ci, CONF_PARSER const *rule)
 {
 	int		ret;
 	uint32_t	value;
-	main_config_t	*conf = parent;
 
 	if ((ret = cf_pair_parse_value(ctx, out, parent, ci, rule)) < 0) return ret;
 
@@ -434,45 +439,52 @@ static int num_workers_parse(TALLOC_CTX *ctx, void *out, void *parent,
 	 *	If no value is specified, try and
 	 *	discover it automatically.
 	 */
-	if (value == 0) {
-		char *strvalue;
-
-		value = fr_hw_num_cores_active();
-
-		/*
-		 *	If we've got more than four times
-		 *	the number of cores as we have
-		 *	networks, then set the number of
-		 *	workers to the number of cores
-		 *	minus networks.
-		 *
-		 *	This ensures at a least a 4:1
-		 *	ratio of workers to networks,
-		 *      which seems like a sensible ratio.
-		 */
-		if ((conf->max_networks * 4) < value) {
-			value -= conf->max_networks;
-		}
-
-		strvalue = talloc_asprintf(ci, "%u", value);
-		(void) cf_pair_replace(cf_item_to_section(cf_parent(ci)), cf_item_to_pair(ci), strvalue);
-		talloc_free(strvalue);
-
-		/*
-		 *	Otherwise just create as many
-		 *	workers as we have cores.
-		 */
-		cf_log_info(ci, "Setting thread.workers = %u", value);
-	} else {
-		FR_INTEGER_BOUND_CHECK("thread.num_workers", value, >=, 1);
-		FR_INTEGER_BOUND_CHECK("thread.num_workers", value, <=, 128);
-	}
+	FR_INTEGER_BOUND_CHECK("thread.num_workers", value, >=, 1);
+	FR_INTEGER_BOUND_CHECK("thread.num_workers", value, <=, 128);
 
 	memcpy(out, &value, sizeof(value));
 
 	return 0;
 }
 
+static int num_workers_dflt(CONF_PAIR **out, void *parent, CONF_SECTION *cs, fr_token_t quote, CONF_PARSER const *rule)
+{
+	char		*strvalue;
+	uint32_t	value;
+	main_config_t	*conf = parent;
+
+	value = fr_hw_num_cores_active();
+	if (value == 0) {
+		cf_log_pwarn(parent, "Failed retrieving core count, defaulting to 1 worker");
+		value = 1;
+	}
+
+	/*
+	 *	If we've got more than four times
+	 *	the number of cores as we have
+	 *	networks, then set the number of
+	 *	workers to the number of cores
+	 *	minus networks.
+	 *
+	 *	This ensures at a least a 4:1
+	 *	ratio of workers to networks,
+	 *      which seems like a sensible ratio.
+	 */
+	else if (value > (conf->max_networks * 4)) {
+		value -= conf->max_networks;
+	}
+	strvalue = talloc_asprintf(NULL, "%u", value);
+	*out = cf_pair_alloc(cs, rule->name, strvalue, T_OP_EQ, T_BARE_WORD, quote);
+	talloc_free(strvalue);
+
+	/*
+	 *	Otherwise just create as many
+	 *	workers as we have cores.
+	 */
+	cf_log_info(cs, "Dynamically determined thread.workers = %u", value);
+
+	return 0;
+}
 
 static int xlat_config_escape(UNUSED request_t *request, fr_value_box_t *vb, UNUSED void *uctx)
 {
@@ -1462,7 +1474,6 @@ void main_config_hup(main_config_t *config)
 }
 
 static fr_table_num_ordered_t config_arg_table[] = {
-	{ L("parse_new_conditions"),	 offsetof(main_config_t, parse_new_conditions) },
 	{ L("use_new_conditions"),	 offsetof(main_config_t, use_new_conditions) },
 	{ L("tmpl_tokenize_all_nested"), offsetof(main_config_t, tmpl_tokenize_all_nested) },
 	{ L("rewrite_update"),		 offsetof(main_config_t, rewrite_update) },
@@ -1482,12 +1493,21 @@ int main_config_parse_option(char const *value)
 	fr_value_box_t box;
 	size_t offset;
 	char const *p;
+	bool *out;
 
 	p = strchr(value, '=');
 	if (!p) return -1;
 
 	offset = fr_table_value_by_substr(config_arg_table, value, p - value, 0);
-	if (!offset) return -1;
+	if (offset) {
+		out = (bool *) (((uintptr_t) main_config) + offset);
+
+	} else if (strncmp(p, "pair_legacy_nested", p - value) != 0) {
+		out = &fr_pair_legacy_nested;
+
+	} else {
+		return -1;
+	}
 
 	p += 1;
 
@@ -1498,7 +1518,7 @@ int main_config_parse_option(char const *value)
 		fr_exit(1);
 	}
 
-       *(bool *) (((uintptr_t) main_config) + offset) = box.vb_bool;
+       *out = box.vb_bool;
 
 	return 0;
 }
@@ -1511,6 +1531,8 @@ bool main_config_migrate_option_get(char const *name)
 	size_t offset;
 
 	if (!main_config) return false;
+
+	if (strcmp(name, "pair_legacy_nested") == 0) return fr_pair_legacy_nested;
 
 	offset = fr_table_value_by_substr(config_arg_table, name, strlen(name), 0);
 	if (!offset) return false;

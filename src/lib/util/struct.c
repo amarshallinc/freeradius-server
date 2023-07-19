@@ -304,7 +304,7 @@ ssize_t fr_struct_from_network(TALLOC_CTX *ctx, fr_pair_list_t *out,
 		 *	If we can't decode this field, then the entire
 		 *	structure is treated as a raw blob.
 		 */
-		if (fr_value_box_from_network(vp, &vp->data, vp->da->type, vp->da,
+		if (fr_value_box_from_network(vp, &vp->data, vp->vp_type, vp->da,
 					      &FR_DBUFF_TMP(p, child_length), child_length, true) < 0) {
 			FR_PROTO_TRACE("fr_struct_from_network - failed decoding child VP %s", vp->da->name);
 			talloc_free(vp);
@@ -477,7 +477,7 @@ static void *struct_next_encodable(fr_dlist_head_t *list, void *current, void *u
 ssize_t fr_struct_to_network(fr_dbuff_t *dbuff,
 			     fr_da_stack_t *da_stack, unsigned int depth,
 			     fr_dcursor_t *parent_cursor, void *encode_ctx,
-			     fr_encode_dbuff_t encode_value, fr_encode_dbuff_t encode_tlv)
+			     fr_encode_dbuff_t encode_value, fr_encode_dbuff_t encode_cursor)
 {
 	fr_dbuff_t		work_dbuff;
 	fr_dbuff_marker_t	hdr;
@@ -506,7 +506,7 @@ ssize_t fr_struct_to_network(fr_dbuff_t *dbuff,
 	/*
 	 *	If we get passed a struct VP, sort its children.
 	 */
-	if (vp->da->type == FR_TYPE_STRUCT) {
+	if (vp->vp_type == FR_TYPE_STRUCT) {
 		fr_pair_t *sorted = fr_dcursor_current(parent_cursor); /* NOT const */
 
 		fr_pair_list_sort(&sorted->vp_group, pair_sort_increasing);
@@ -752,12 +752,12 @@ ssize_t fr_struct_to_network(fr_dbuff_t *dbuff,
 		 *	This check is really for "nested" VPs.
 		 */
 		if ((vp->da->parent == key_da) &&
-		    (vp->da->type == FR_TYPE_STRUCT)) {
+		    (vp->vp_type == FR_TYPE_STRUCT)) {
 			ssize_t	len;
 			fr_proto_da_stack_build(da_stack, vp->da);
 
 			len = fr_struct_to_network(&work_dbuff, da_stack, depth + 2, /* note + 2 !!! */
-						   cursor, encode_ctx, encode_value, encode_tlv);
+						   cursor, encode_ctx, encode_value, encode_cursor);
 			if (len < 0) return len;
 			goto done;
 		}
@@ -775,7 +775,7 @@ ssize_t fr_struct_to_network(fr_dbuff_t *dbuff,
 			fr_proto_da_stack_build(da_stack, vp->da->parent);
 
 			len = fr_struct_to_network(&work_dbuff, da_stack, depth + 2, /* note + 2 !!! */
-						   cursor, encode_ctx, encode_value, encode_tlv);
+						   cursor, encode_ctx, encode_value, encode_cursor);
 			if (len < 0) return len;
 			goto done;
 		}
@@ -784,7 +784,7 @@ ssize_t fr_struct_to_network(fr_dbuff_t *dbuff,
 		 *	The next VP is likely octets and unknown.
 		 */
 		if ((vp->da->parent == key_da) &&
-		    (vp->da->type != FR_TYPE_TLV)) {
+		    (vp->vp_type != FR_TYPE_TLV)) {
 			if (fr_value_box_to_network(&work_dbuff, &vp->data) <= 0) return -1;
 			(void) fr_dcursor_next(cursor);
 			goto done;
@@ -800,8 +800,8 @@ done:
 	if (tlv) {
 		ssize_t slen;
 
-		if (!encode_tlv) {
-			fr_strerror_printf("Asked to encode TLV %s, but not passed an encoding function",
+		if (!encode_cursor) {
+			fr_strerror_printf("Asked to encode child attribute %s, but we were not passed an encoding function",
 					   tlv->name);
 			return -1;
 		}
@@ -812,7 +812,7 @@ done:
 		 *	Encode any TLV attributes which are part of this structure.
 		 */
 		while (vp && (da_stack->da[depth] == parent) && (da_stack->depth >= parent->depth)) {
-			slen = encode_tlv(&work_dbuff, da_stack, depth + 1, cursor, encode_ctx);
+			slen = encode_cursor(&work_dbuff, da_stack, depth + 1, cursor, encode_ctx);
 			if (slen < 0) return slen;
 
 			vp = fr_dcursor_current(cursor);

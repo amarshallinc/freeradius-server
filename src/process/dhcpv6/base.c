@@ -60,6 +60,10 @@ typedef struct {
 	CONF_SECTION	*send_relay_reply;
 
 	CONF_SECTION	*do_not_respond;
+
+	CONF_SECTION	*new_client;
+	CONF_SECTION	*add_client;
+	CONF_SECTION	*deny_client;
 } process_dhcpv6_sections_t;
 
 typedef struct {
@@ -164,11 +168,14 @@ fr_dict_enum_autoload_t process_dhcpv6_dict_enum[] = {
 	{ NULL }
 };
 
+#define FR_DHCPV6_PROCESS_CODE_VALID(_x) (FR_DHCPV6_PACKET_CODE_VALID(_x) || (_x == FR_DHCPV6_DO_NOT_RESPOND))
+
 #define PROCESS_PACKET_TYPE		fr_dhcpv6_packet_code_t
 #define PROCESS_CODE_MAX		FR_DHCPV6_CODE_MAX
 #define PROCESS_CODE_DO_NOT_RESPOND	FR_DHCPV6_DO_NOT_RESPOND
-#define PROCESS_PACKET_CODE_VALID	FR_DHCPV6_PACKET_CODE_VALID
+#define PROCESS_PACKET_CODE_VALID	FR_DHCPV6_PROCESS_CODE_VALID
 #define PROCESS_INST			process_dhcpv6_t
+#define PROCESS_CODE_DYNAMIC_CLIENT	FR_DHCPV6_REPLY
 
 /*
  *	DHCPv6 is nonstandard in that we reply
@@ -271,6 +278,9 @@ static const virtual_server_compile_t compile_list[] = {
 		.component = MOD_POST_AUTH,
 		.offset = PROCESS_CONF_OFFSET(do_not_respond)
 	},
+
+	DYNAMIC_CLIENT_SECTIONS,
+
 	COMPILE_TERMINATOR
 };
 
@@ -331,7 +341,7 @@ static void dhcpv6_packet_debug(request_t *request, fr_radius_packet_t const *pa
 static inline CC_HINT(always_inline)
 process_dhcpv6_client_fields_t *dhcpv6_client_fields_store(request_t *request, bool expect_server_id)
 {
-	fr_pair_t			*transaction_id, *client_id, *server_id;
+	fr_pair_t			*transaction_id;
 	process_dhcpv6_client_fields_t	*rctx;
 
 	transaction_id = fr_pair_find_by_da(&request->request_pairs, NULL, attr_transaction_id);
@@ -346,21 +356,6 @@ process_dhcpv6_client_fields_t *dhcpv6_client_fields_store(request_t *request, b
 		return NULL;
 	}
 
-	client_id = fr_pair_find_by_ancestor(&request->request_pairs, NULL, attr_client_id);
-	if (!client_id) {
-		REDEBUG("Missing Client-ID");
-		return NULL;
-	}
-
-	server_id = fr_pair_find_by_ancestor(&request->request_pairs, NULL, attr_server_id);
-	if (!server_id && expect_server_id) {
-		REDEBUG("Missing Server-ID");
-		return NULL;
-	} else if (server_id && !expect_server_id) {
-		REDEBUG("Server-ID should not be present");
-		return NULL;
-	}
-
 	MEM(rctx = talloc_zero(unlang_interpret_frame_talloc_ctx(request), process_dhcpv6_client_fields_t));
 	rctx->transaction_id = fr_pair_copy(rctx, transaction_id);
 
@@ -371,20 +366,41 @@ process_dhcpv6_client_fields_t *dhcpv6_client_fields_store(request_t *request, b
 	 *	These should just become straight copies
 	 *	when the structure pairs are nested.
 	 */
-	if (fr_pair_list_copy_by_ancestor(rctx, &rctx->client_id,
-					  &request->request_pairs, attr_client_id, 0) < 0) {
+	switch (fr_pair_list_copy_by_ancestor(rctx, &rctx->client_id,
+					      &request->request_pairs, attr_client_id)) {
+	case -1:
 		REDEBUG("Error copying Client-ID");
 	error:
 		talloc_free(rctx);
 		return NULL;
+
+	case 0:
+		REDEBUG("Missing Client-ID");
+		goto error;
+
+	default:
+		break;
 	}
 
-	if (expect_server_id) {
-		if (fr_pair_list_copy_by_ancestor(rctx, &rctx->server_id,
-						  &request->request_pairs, attr_server_id, 0) < 0) {
+	switch (fr_pair_list_copy_by_ancestor(rctx, &rctx->server_id,
+					      &request->request_pairs, attr_server_id)) {
+	case -1:
 			REDEBUG("Error copying Server-ID");
 			goto error;
+
+	case 0:
+		if (expect_server_id) {
+			REDEBUG("Missing Server-ID");
+			goto error;
 		}
+		break;
+
+	default:
+		if (!expect_server_id) {
+			REDEBUG("Server-ID should not be present");
+			goto error;
+		}
+		break;
 	}
 
 	return rctx;
@@ -733,6 +749,10 @@ static unlang_action_t mod_process(rlm_rcode_t *p_result, module_ctx_t const *mc
 	}
 
 	dhcpv6_packet_debug(request, request->packet, &request->request_pairs, true);
+
+	if (unlikely(request_is_dynamic_client(request))) {
+		return new_client(p_result, mctx, request);
+	}
 
 	return state->recv(p_result, mctx, request);
 }

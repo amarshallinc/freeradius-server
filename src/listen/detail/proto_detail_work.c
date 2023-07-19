@@ -141,7 +141,7 @@ static fr_event_update_t resume_read[] = {
 	{ 0 }
 };
 
-static ssize_t mod_read(fr_listen_t *li, void **packet_ctx, fr_time_t *recv_time_p, uint8_t *buffer, size_t buffer_len, size_t *leftover, uint32_t *priority, UNUSED bool *is_dup)
+static ssize_t mod_read(fr_listen_t *li, void **packet_ctx, fr_time_t *recv_time_p, uint8_t *buffer, size_t buffer_len, size_t *leftover)
 {
 	proto_detail_work_t const	*inst = talloc_get_type_abort_const(li->app_io_instance, proto_detail_work_t);
 	proto_detail_work_thread_t	*thread = talloc_get_type_abort(li->thread_instance, proto_detail_work_thread_t);
@@ -155,6 +155,7 @@ static ssize_t mod_read(fr_listen_t *li, void **packet_ctx, fr_time_t *recv_time
 
 	fr_assert(*leftover < buffer_len);
 	fr_assert(thread->fd >= 0);
+	fr_assert(thread->el);
 
 	MPRINT("AT COUNT %d offset %ld", thread->count, (long) thread->read_offset);
 
@@ -184,7 +185,6 @@ static ssize_t mod_read(fr_listen_t *li, void **packet_ctx, fr_time_t *recv_time
 		DEBUG("Retrying packet %d (retransmission %u)", track->id, track->retry.count);
 		*packet_ctx = track;
 		*recv_time_p = track->timestamp;
-		*priority = inst->parent->priority;
 		return track->packet_len;
 	}
 
@@ -500,7 +500,6 @@ redo:
 
 	*packet_ctx = track;
 	*recv_time_p = track->timestamp;
-	*priority = inst->parent->priority;
 
 done:
 	/*
@@ -715,6 +714,18 @@ static int mod_open(fr_listen_t *li)
 	fr_assert(thread->name == NULL);
 	fr_assert(thread->filename_work != NULL);
 	thread->name = talloc_typed_asprintf(thread, "detail_work reading file %s", thread->filename_work);
+
+	/*
+	 *	Linux doesn't like us adding write callbacks for FDs
+	 *	which reference files.  Since the callback is only
+	 *	used when the FD blocks, and files don't (mostly)
+	 *	block, we just mark this read-only.
+	 *
+	 *	The code in src/lib/io/network.c will call the
+	 *	mod_write() callback on any write, even if the
+	 *	listener is marked "read_only"
+	 */
+	li->no_write_callback = true;
 
 	return 0;
 }

@@ -41,6 +41,8 @@ struct fr_listen {
 
 	bool			connected;		//!< is this for a connected socket?
 	bool			track_duplicates;	//!< do we track duplicate packets?
+	bool			no_write_callback;     	//!< sometimes we don't need to do writes
+
 	size_t			default_message_size;	//!< copied from app_io, but may be changed
 	size_t			num_messages;		//!< for the message ring buffer
 };
@@ -49,14 +51,13 @@ struct fr_listen {
  *	Minimal data structure to use the new code.
  */
 struct fr_async_s {
-	module_method_t		process;		//!< The current state function.
-	void			*process_inst;		//!< Instance data for the current state machine.
-
 	fr_time_t		recv_time;
 	fr_event_list_t		*el;
 
 	fr_time_tracking_t	tracking;
 	fr_channel_t		*channel;
+
+	fr_dlist_t		entry;		//!< in the list of requests associated with this channel
 
 	void			*packet_ctx;
 	fr_listen_t		*listen;	//!< How we received this request,

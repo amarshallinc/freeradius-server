@@ -265,6 +265,7 @@ static xlat_action_t xlat_test(UNUSED TALLOC_CTX *ctx, UNUSED fr_dcursor_t *out,
 static char		proto_name_prev[128];
 static dl_t		*dl;
 static dl_loader_t	*dl_loader = NULL;
+static bool		parse_new_conditions = true;
 
 static fr_event_list_t	*el = NULL;
 
@@ -1462,7 +1463,7 @@ static size_t command_radmin_tab(command_result_t *result, command_file_ctx_t *c
 static size_t command_condition_normalise(command_result_t *result, command_file_ctx_t *cc,
 					  char *data, UNUSED size_t data_used, char *in, size_t inlen)
 {
-	ssize_t			dec_len;
+	ssize_t			slen;
 	fr_cond_t		*cond;
 	CONF_SECTION		*cs;
 	size_t			len;
@@ -1475,9 +1476,11 @@ static size_t command_condition_normalise(command_result_t *result, command_file
 	cf_filename_set(cs, cc->filename);
 	cf_lineno_set(cs, cc->lineno);
 
-	dec_len = fr_cond_tokenize(cs, &cond, &cc->tmpl_rules, &FR_SBUFF_IN(in, inlen), false);
-	if (dec_len <= 0) {
-		fr_strerror_printf_push_head("ERROR offset %d", (int) -dec_len);
+	fr_skip_whitespace(in);
+
+	slen = fr_cond_tokenize(cs, &cond, &cc->tmpl_rules, &FR_SBUFF_IN(in, inlen), false);
+	if (slen <= 0) {
+		fr_strerror_printf_push_head("ERROR offset %d", (int) -slen);
 
 	return_error:
 		talloc_free(cs);
@@ -1491,10 +1494,27 @@ static size_t command_condition_normalise(command_result_t *result, command_file
 		}
 	}
 
-	in += dec_len;
-	if (*in != '\0') {
-		fr_strerror_printf_push_head("ERROR offset %d 'Too much text'", (int) dec_len);
+	if (in[slen] != '\0') {
+		fr_strerror_printf_push_head("ERROR offset %d 'Too much text'", (int) slen);
 		goto return_error;
+	}
+
+	/*
+	 *	Use the new condition parser.  Except for !&foo==bar, because the
+	 *	new one requires that to be formatted as !(&foo==bar).
+	 *
+	 *	Perhaps we should just change that?
+	 */
+	if (parse_new_conditions && ((in[0] != '!') || (in[1] == '('))) {
+		xlat_exp_head_t *head = NULL;
+
+		slen = xlat_tokenize_condition(cc->tmp_ctx, &head, &FR_SBUFF_IN(in, inlen), NULL, &cc->tmpl_rules);
+		if (slen <= 0) {
+			fr_strerror_printf_push_head("ERROR in xlat_tokenize_cond offset %d", (int) -slen);
+			goto return_error;
+		}
+
+		talloc_free(head);
 	}
 
 	len = cond_print(&FR_SBUFF_OUT(data, COMMAND_OUTPUT_MAX), cond);
@@ -2033,6 +2053,67 @@ static size_t command_encode_raw(command_result_t *result, command_file_ctx_t *c
 	RETURN_OK(hex_print(data, COMMAND_OUTPUT_MAX, cc->buffer_start, len));
 }
 
+/** Parse a list of pairs
+ *
+ */
+static size_t command_read_file(command_result_t *result, command_file_ctx_t *cc,
+			    char *data, UNUSED size_t data_used, char *in, UNUSED size_t inlen)
+{
+	ssize_t slen;
+	fr_pair_list_t head;
+	fr_pair_t *vp;
+	bool done = false;
+	char *filename, *p, *end;
+	FILE *fp;
+
+	filename = talloc_asprintf(cc->tmp_ctx, "%s/%s", cc->path, in);
+
+	fp = fopen(filename, "r");
+	talloc_free(filename);
+
+	if (!fp) {
+		fr_strerror_printf("Failed opening %s - %s", in, fr_syserror(errno));
+		RETURN_OK_WITH_ERROR();
+	}
+
+	fr_pair_list_init(&head);
+	slen = fr_pair_list_afrom_file(cc->tmp_ctx, cc->tmpl_rules.attr.dict_def, &head, fp, &done);
+	fclose(fp);
+	if (slen < 0) {
+		RETURN_OK_WITH_ERROR();
+	}
+
+	/*
+	 *	Print the pairs.
+	 */
+	p = data;
+	end = data + COMMAND_OUTPUT_MAX;
+	for (vp = fr_pair_list_head(&head);
+	     vp != NULL;
+	     vp = fr_pair_list_next(&head, vp)) {
+		if ((slen = fr_pair_print(&FR_SBUFF_OUT(p, end), NULL, vp)) <= 0) RETURN_OK_WITH_ERROR();
+		p += (size_t)slen;
+
+		if (p >= end) break;
+
+		*(p++) = ',';
+		*(p++) = ' ';
+	}
+
+	/*
+	 *	Delete the trailing ", ".
+	 */
+	if (p > data) p -= 2;
+	*p = 0;
+
+	if (!done) strlcpy(p, "!DONE", (end - p));
+
+	fr_pair_list_free(&head);
+
+	RETURN_OK(p - data);
+}
+
+
 static size_t command_returned(command_result_t *result, command_file_ctx_t *cc,
 			       char *data, UNUSED size_t data_used, UNUSED char *in, UNUSED size_t inlen)
 {
@@ -2390,6 +2471,53 @@ static size_t command_max_buffer_size(command_result_t *result, command_file_ctx
 	cc->buffer_end = POISONED_BUFFER_END(cc->buffer);
 
 	RETURN_OK(snprintf(data, COMMAND_OUTPUT_MAX, "%ld", size));
+}
+
+/** Set or clear migration flags.
+ *
+ */
+static size_t command_migrate(command_result_t *result, UNUSED command_file_ctx_t *cc,
+			      UNUSED char *data, UNUSED size_t data_used, char *in, UNUSED size_t inlen)
+{
+	char *p;
+	bool *out;
+
+	fr_skip_whitespace(in);
+	p = in;
+
+	if (strncmp(p, "pair_legacy_nested", sizeof("pair_legacy_nested") - 1) == 0) {
+		p += sizeof("pair_legacy_nested") - 1;
+		out = &fr_pair_legacy_nested;
+
+	} else if (strncmp(p, "parse_new_conditions", sizeof("parse_new_conditions") - 1) == 0) {
+		p += sizeof("parse_new_conditions") - 1;
+		out = &parse_new_conditions;
+
+	} else {
+		fr_strerror_const("Unknown migration flag");
+		RETURN_PARSE_ERROR(0);
+	}
+
+	fr_skip_whitespace(p);
+	if (*p != '=') {
+		fr_strerror_const("Missing '=' after flag");
+		RETURN_PARSE_ERROR(0);
+	}
+	p++;
+
+	fr_skip_whitespace(p);
+	if ((strcmp(p, "yes") == 0) || (strcmp(p, "true") == 0) || (strcmp(p, "1") == 0)) {
+		*out = true;
+
+	} else if ((strcmp(p, "no") == 0) || (strcmp(p, "false") == 0) || (strcmp(p, "0") == 0)) {
+		*out = false;
+
+	} else {
+		fr_strerror_const("Invalid value for flag");
+		RETURN_PARSE_ERROR(0);
+	}
+
+	RETURN_OK(0);
 }
 
 /** Skip the test file if we're missing a particular feature
@@ -3104,6 +3232,11 @@ static fr_table_ptr_sorted_t	commands[] = {
 					.usage = "max-buffer-size[ <intger>]",
 					.description = "Limit the maximum temporary buffer space available for any command which uses it"
 				}},
+	{ L("migrate "),	&(command_entry_t){
+					.func = command_migrate,
+					.usage = "migrate <flag>=<value>",
+					.description = "Set migration flag"
+				}},
 	{ L("need-feature "),	&(command_entry_t){
 					.func = command_need_feature,
 					.usage = "need-feature <feature>",
@@ -3133,6 +3266,11 @@ static fr_table_ptr_sorted_t	commands[] = {
 					.func = command_encode_raw,
 					.usage = "raw <string>",
 					.description = "Create nested attributes from OID strings and values"
+				}},
+	{ L("read_file "),		&(command_entry_t){
+					.func = command_read_file,
+					.usage = "read_file <filename>",
+					.description = "Read a list of pairs from a file",
 				}},
 	{ L("returned"),		&(command_entry_t){
 					.func = command_returned,

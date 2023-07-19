@@ -129,7 +129,7 @@ fr_dict_attr_autoload_t proto_dhcpv6_udp_dict_attr[] = {
 };
 
 static ssize_t mod_read(fr_listen_t *li, void **packet_ctx, fr_time_t *recv_time_p, uint8_t *buffer, size_t buffer_len,
-			size_t *leftover, UNUSED uint32_t *priority, UNUSED bool *is_dup)
+			size_t *leftover)
 {
 	proto_dhcpv6_udp_t const	*inst = talloc_get_type_abort_const(li->app_io_instance, proto_dhcpv6_udp_t);
 	proto_dhcpv6_udp_thread_t	*thread = talloc_get_type_abort(li->thread_instance, proto_dhcpv6_udp_thread_t);
@@ -426,7 +426,7 @@ static void *mod_track_create(UNUSED void const *instance, UNUSED void *thread_i
 
 	option_len = fr_nbo_to_uint16(option + 2);
 
-	if ((option + option_len) > (packet + packet_len)) return NULL;
+	if (option_len > ((packet - option) + packet_len)) return NULL;
 
 	t = (proto_dhcpv6_track_t *) talloc_zero_array(track, uint8_t, t_size + option_len);
 	if (!t) return NULL;
@@ -435,7 +435,6 @@ static void *mod_track_create(UNUSED void const *instance, UNUSED void *thread_i
 
 	memcpy(&t->header, packet, 4); /* packet code + 24-bit transaction ID */
 
-	/* coverity[tainted_data] */
 	memcpy(&t->client_id[0], option + 4, option_len);
 	t->client_id_len = option_len;
 
@@ -543,7 +542,7 @@ static int mod_bootstrap(module_inst_ctx_t const *mctx)
 
 			if (fr_interface_to_ipaddr(inst->interface, &inst->src_ipaddr, AF_INET6, true) < 0) {
 				cf_log_err(conf, "No 'src_ipaddr' specified, and we cannot determine "
-					   "one for 'ipaddr = %pV and interface '%s'",
+					   "one for 'ipaddr = %pV' and interface '%s'",
 					   fr_box_ipaddr(inst->ipaddr), inst->interface);
 				return -1;
 			}
@@ -562,7 +561,7 @@ static int mod_bootstrap(module_inst_ctx_t const *mctx)
 	 *	Get the MAC address associated with this interface.
 	 *	It can be used to create a server ID.
 	 */
-	(void) fr_interface_to_ethernet(inst->interface, &inst->ethernet);
+	if (inst->interface) fr_interface_to_ethernet(inst->interface, &inst->ethernet);
 
 	if (inst->recv_buff_is_set) {
 		FR_INTEGER_BOUND_CHECK("recv_buff", inst->recv_buff, >=, 32);

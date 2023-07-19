@@ -164,7 +164,7 @@ static uint8_t tacacs_encode_body_arg_cnt(fr_pair_list_t *vps, fr_dict_attr_t co
 		/*
 		 *	Recurse into children.
 		 */
-		if (vp->da->type == FR_TYPE_VENDOR) {
+		if (vp->vp_type == FR_TYPE_VENDOR) {
 			arg_cnt += tacacs_encode_body_arg_cnt(&vp->vp_group, NULL);
 			continue;
 		}
@@ -205,7 +205,7 @@ static ssize_t tacacs_encode_body_arg_n(fr_dbuff_t *dbuff, uint8_t arg_cnt, uint
 			FR_PROTO_TRACE("arg[%d] --> %s", i, vp->vp_strvalue);
 			len = vp->vp_length;
 
-		} else if (vp->da->type == FR_TYPE_VENDOR) {
+		} else if (vp->vp_type == FR_TYPE_VENDOR) {
 			ssize_t slen;
 			uint8_t child_argc;
 
@@ -857,7 +857,7 @@ ssize_t fr_tacacs_encode(fr_dbuff_t *dbuff, uint8_t const *original_packet, char
 			/*
 			 *	If the caller didn't set a session ID, use a random one.
 			 */
-			if (!fr_pair_find_by_da(vps, NULL, attr_tacacs_session_id)) {
+			if (!fr_pair_find_by_da_nested(vps, NULL, attr_tacacs_session_id)) {
 				packet->hdr.session_id = fr_rand();
 			}
 
@@ -978,7 +978,7 @@ ssize_t fr_tacacs_encode(fr_dbuff_t *dbuff, uint8_t const *original_packet, char
 		uint8_t flags = packet->hdr.flags;
 
 		packet->hdr.flags |= FR_TAC_PLUS_UNENCRYPTED_FLAG;
-		fr_tacacs_packet_log_hex(&default_log, packet);
+		fr_tacacs_packet_log_hex(&default_log, packet, packet_len);
 		packet->hdr.flags = flags;
 	}
 #endif

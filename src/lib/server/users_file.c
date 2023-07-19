@@ -315,12 +315,12 @@ int pairlist_read(TALLOC_CTX *ctx, fr_dict_t const *dict, char const *file, PAIR
 		}
 
 		/*
-		 *	We're trying to read a name.  It MUST have
+		 *	We're trying to read a key value.  It MUST have
 		 *	been at the start of the line.  So whatever
 		 *	this is, it's wrong.
 		 */
 		if (leading_spaces) {
-	    		ERROR_MARKER(&sbuff, "Entry does not begin with a user name");
+	    		ERROR_MARKER(&sbuff, "Entry does not begin with a key value");
 		fail:
 			fclose(fp);
 			return -1;
@@ -421,15 +421,16 @@ check_item:
 			goto fail_entry;
 		}
 
-		if (tmpl_contains_regex(new_map->rhs)) {
-			/*
-			 *	The default rules say that the check
-			 *	items look at the control list, but
-			 *	for regexes we want to look at the
-			 *	request list.
-			 */
+		/*
+		 *	The default rule says that the check
+		 *	items look at the control list, but
+		 *	protocol attributes should be compared in the request.
+		 */
+		if (!tmpl_attr_tail_da(new_map->lhs)->flags.internal) {
 			tmpl_attr_set_list(new_map->lhs, request_attr_request);
+		}
 
+		if (tmpl_contains_regex(new_map->rhs)) {
 			if (tmpl_is_regex_uncompiled(new_map->rhs) &&
 			    (tmpl_regex_compile(new_map->rhs, false) < 0)) {
 				ERROR("%s[%d]: Failed compiling regular expression /%s/ - %s",

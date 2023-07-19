@@ -44,8 +44,6 @@ typedef struct {
 	/*
 	 *	User object attributes and filters
 	 */
-	tmpl_t	*userobj_filter;		//!< Filter to retrieve only user objects.
-	tmpl_t	*userobj_base_dn;		//!< DN to search for users under.
 	char const	*userobj_scope_str;		//!< Scope (sub, one, base).
 	char const	*userobj_sort_by;		//!< List of attributes to sort by.
 	LDAPControl	*userobj_sort_ctrl;		//!< Server side sort control.
@@ -65,7 +63,6 @@ typedef struct {
 	 *	Group object attributes and filters
 	 */
 	char const	*groupobj_filter;		//!< Filter to retrieve only group objects.
-	tmpl_t	*groupobj_base_dn;		//!< DN to search for users under.
 	char const	*groupobj_scope_str;		//!< Scope (sub, one, base).
 	int		groupobj_scope;			//!< Search scope.
 
@@ -122,9 +119,10 @@ typedef struct {
 
 	fr_ldap_config_t handle_config;			//!< Connection configuration instance.
 	fr_trunk_conf_t	trunk_conf;			//!< Trunk configuration
+	fr_trunk_conf_t	bind_trunk_conf;		//!< Trunk configuration for trunk used for bind auths
 } rlm_ldap_t;
 
-/** Module environment used in LDAP authorization
+/** Call environment used in LDAP authorization
  *
  */
 typedef struct {
@@ -136,7 +134,16 @@ typedef struct {
 							//!< No value should be set if profiles are not being used
 							//!< as there is an associated performance penalty.
 	fr_value_box_t	profile_filter;			//!< Filter to use when searching for profiles.
-} ldap_autz_mod_env_t;
+} ldap_autz_call_env_t;
+
+/** Call environment used in group membership xlat
+ *
+ */
+typedef struct {
+	fr_value_box_t	user_base;			//!< Base DN in which to search for users.
+	fr_value_box_t	user_filter;			//!< Filter to use when searching for users.
+	fr_value_box_t	group_base;			//!< Base DN in which to search for groups.
+} ldap_memberof_call_env_t;
 
 /** State list for resumption of authorization
  *
@@ -146,6 +153,7 @@ typedef enum {
 	LDAP_AUTZ_GROUP,
 	LDAP_AUTZ_POST_GROUP,
 #ifdef WITH_EDIR
+	LDAP_AUTZ_EDIR_BIND,
 	LDAP_AUTZ_POST_EDIR,
 #endif
 	LDAP_AUTZ_POST_DEFAULT_PROFILE,
@@ -162,14 +170,42 @@ typedef struct {
 	fr_ldap_map_exp_t	expanded;
 	fr_ldap_query_t		*query;
 	fr_ldap_thread_trunk_t	*ttrunk;
-	ldap_autz_mod_env_t	*mod_env;
+	ldap_autz_call_env_t	*call_env;
 	LDAPMessage		*entry;
 	ldap_autz_status_t	status;
 	struct berval		**profile_values;
 	int			value_idx;
 	char			*profile_value;
+	char const		*dn;
 } ldap_autz_ctx_t;
 
+/** State list for xlat evaluation of LDAP group membership
+ */
+typedef enum {
+	GROUP_XLAT_FIND_USER = 0,
+	GROUP_XLAT_MEMB_FILTER,
+	GROUP_XLAT_MEMB_ATTR
+} ldap_group_xlat_status_t;
+
+/** Holds state of in progress group membership check xlat
+ *
+ */
+typedef struct {
+	rlm_ldap_t const		*inst;
+	fr_value_box_t			*group;
+	ldap_memberof_call_env_t	*env_data;
+	bool				group_is_dn;
+	char const			*dn;
+	char const			*attrs[2];
+	fr_value_box_t			*filter;
+	fr_value_box_t			*basedn;
+	fr_ldap_thread_trunk_t		*ttrunk;
+	fr_ldap_query_t			*query;
+	ldap_group_xlat_status_t	status;
+	bool				found;
+} ldap_memberof_xlat_ctx_t;
+
+extern HIDDEN fr_dict_attr_t const *attr_password;
 extern HIDDEN fr_dict_attr_t const *attr_cleartext_password;
 extern HIDDEN fr_dict_attr_t const *attr_crypt_password;
 extern HIDDEN fr_dict_attr_t const *attr_ldap_userdn;
@@ -197,9 +233,6 @@ int rlm_ldap_find_user_async(TALLOC_CTX *ctx, rlm_ldap_t const *inst, request_t 
 			     fr_value_box_t *filter_box, fr_ldap_thread_trunk_t *ttrunk, char const *attrs[],
 			     fr_ldap_query_t **query_out);
 
-char const *rlm_ldap_find_user(rlm_ldap_t const *inst, request_t *request, fr_ldap_thread_trunk_t *tconn,
-			       char const *attrs[], bool force, LDAPMessage **result, LDAP **handle, rlm_rcode_t *rcode);
-
 rlm_rcode_t rlm_ldap_check_access(rlm_ldap_t const *inst, request_t *request, LDAPMessage *entry);
 
 void rlm_ldap_check_reply(module_ctx_t const *mctx, request_t *request, fr_ldap_thread_trunk_t const *ttrunk);
@@ -212,13 +245,11 @@ unlang_action_t rlm_ldap_cacheable_userobj(rlm_rcode_t *p_result, request_t *req
 
 unlang_action_t rlm_ldap_cacheable_groupobj(rlm_rcode_t *p_result, request_t *request, ldap_autz_ctx_t *autz_ctx);
 
-unlang_action_t rlm_ldap_check_groupobj_dynamic(rlm_rcode_t *p_result,
-						rlm_ldap_t const *inst, request_t *request, fr_ldap_thread_trunk_t *ttrunk,
-						fr_pair_t const *check);
+unlang_action_t rlm_ldap_check_groupobj_dynamic(rlm_rcode_t *p_result, request_t *request,
+						ldap_memberof_xlat_ctx_t *xlat_ctx);
 
-unlang_action_t rlm_ldap_check_userobj_dynamic(rlm_rcode_t *p_result,
-					       rlm_ldap_t const *inst, request_t *request, fr_ldap_thread_trunk_t *ttrunk,
-					       char const *dn, fr_pair_t const *check);
+unlang_action_t rlm_ldap_check_userobj_dynamic(rlm_rcode_t *p_result, request_t *request,
+					       ldap_memberof_xlat_ctx_t *xlat_ctx);
 
 unlang_action_t rlm_ldap_check_cached(rlm_rcode_t *p_result,
-				      rlm_ldap_t const *inst, request_t *request, fr_pair_t const *check);
+				      rlm_ldap_t const *inst, request_t *request, fr_value_box_t const *check);

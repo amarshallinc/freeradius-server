@@ -180,7 +180,7 @@ static int getusersfile(TALLOC_CTX *ctx, char const *filename, fr_htrie_t **ptre
 			 */
 			if ((fr_dict_vendor_num_by_da(da) != 0) ||
 			    (da->attr < 0x100)) {
-				WARN("%s[%d] Changing '%s =' to '%s =='\n\tfor comparing RADIUS attribute in check item list for user %s",
+				WARN("%s[%d] Changing '%s =' to '%s =='\n\tfor comparing RADIUS attribute in check item list for key %s",
 				     entry->filename, entry->lineno,
 				     da->name, da->name,
 				     entry->name);
@@ -220,7 +220,7 @@ static int getusersfile(TALLOC_CTX *ctx, char const *filename, fr_htrie_t **ptre
 			 */
 			if (fr_dict_attr_is_top_level(da) && (da->attr > 1000)) {
 				WARN("%s[%d] Check item \"%s\"\n"
-				     "\tfound in reply item list for user \"%s\".\n"
+				     "\tfound in reply item list for key value \"%s\".\n"
 				     "\tThis attribute MUST go on the first line"
 				     " with the other check items", entry->filename, entry->lineno, da->name,
 				     entry->name);
@@ -381,7 +381,7 @@ static int mod_instantiate(module_inst_ctx_t const *mctx)
  *	Common code called by everything below.
  */
 static unlang_action_t file_common(rlm_rcode_t *p_result, UNUSED rlm_files_t const *inst, rlm_files_env_t *env,
-				   request_t *request, char const *filename, fr_htrie_t *tree, PAIR_LIST_LIST *default_list)
+				   request_t *request, fr_htrie_t *tree, PAIR_LIST_LIST *default_list)
 {
 	PAIR_LIST_LIST const	*user_list;
 	PAIR_LIST const 	*user_pl, *default_pl;
@@ -402,7 +402,10 @@ static unlang_action_t file_common(rlm_rcode_t *p_result, UNUSED rlm_files_t con
 		trie = (tree->type == FR_HTRIE_TRIE);
 
 		/*
-		 *	Grab our own copy of the key if necessary.
+		 *	Convert the value-box to a key for use in a trie.  The trie assumes that the key
+		 *	starts at the high bit of the data, and that isn't always the case.  e.g. "bool" and
+		 *	"integer" may be in host byte order, in which case we have to convert them to network
+		 *	byte order.
 		 */
 		if (user_list && trie) {
 			key = key_buffer;
@@ -412,21 +415,6 @@ static unlang_action_t file_common(rlm_rcode_t *p_result, UNUSED rlm_files_t con
 
 			RDEBUG3("Keylen %ld", keylen);
 			RHEXDUMP3(key, (keylen + 7) >> 3, "KEY ");
-
-			/*
-			 *	We're going to free the value_box
-			 *	shortly, so copy the key to our
-			 *	internal key buffer.
-			 */
-			if (key != key_buffer) {
-				if (((keylen + 7) >> 3) > sizeof(key_buffer)) {
-					REDEBUG("Key is too long - truncating");
-					keylen = sizeof(key_buffer) << 3;
-				}
-
-				memcpy(key_buffer, key, (keylen + 7) >> 3);
-				key = key_buffer;
-			}
 		}
 
 		user_pl = user_list ? fr_dlist_head(&user_list->head) : NULL;
@@ -454,18 +442,24 @@ redo:
 		 */
 		if (!default_pl && user_pl) {
 			pl = user_pl;
+
+			RDEBUG3("DEFAULT[] USER[%d]=%s", user_pl->lineno, user_pl->name);
 			user_pl = fr_dlist_next(&user_list->head, user_pl);
 
 		} else if (!user_pl && default_pl) {
 			pl = default_pl;
+			RDEBUG3("DEFAULT[%d]= USER[]=", default_pl->lineno);
 			default_pl = fr_dlist_next(&default_list->head, default_pl);
 
 		} else if (user_pl->order < default_pl->order) {
 			pl = user_pl;
+
+			RDEBUG3("DEFAULT[%d]= USER[%d]=%s (choosing user)", default_pl->lineno, user_pl->lineno, user_pl->name);
 			user_pl = fr_dlist_next(&user_list->head, user_pl);
 
 		} else {
 			pl = default_pl;
+			RDEBUG3("DEFAULT[%d]= USER[%d]=%s (choosing default)", default_pl->lineno, user_pl->lineno, user_pl->name);
 			default_pl = fr_dlist_next(&default_list->head, default_pl);
 		}
 
@@ -476,6 +470,8 @@ redo:
 		 */
 		while ((map = map_list_next(&pl->check, map))) {
 			fr_pair_list_t tmp_list;
+
+			RDEBUG3("    %s %s %s", map->lhs->name, fr_tokens[map->op], map->rhs->name);
 
 			/*
 			 *	Control items get realized to VPs, and
@@ -502,7 +498,10 @@ redo:
 				 *	Evaluate the map, including regexes.
 				 */
 			default:
-				if (!fr_cond_eval_map(request, map)) match = false;
+				if (!fr_cond_eval_map(request, map)) {
+					RDEBUG3("    failed match - %s", fr_strerror());
+					match = false;
+				}
 				break;
 			}
 
@@ -514,7 +513,7 @@ redo:
 			continue;
 		}
 
-		RDEBUG2("Found match \"%s\" on line %d of %s", pl->name, pl->lineno, filename);
+		RDEBUG2("Found match \"%s\" on line %d of %s", pl->name, pl->lineno, pl->filename);
 		found = true;
 		fall_through = false;
 		next_shortest_prefix = false;
@@ -523,7 +522,6 @@ redo:
 		 *	Move the control items over, too.
 		 */
 		fr_pair_list_move_op(&request->control_pairs, &list, T_OP_ADD_EQ);
-		fr_pair_list_free(&list);
 
 		/* ctx may be reply */
 		if (!map_list_empty(&pl->reply)) {
@@ -628,7 +626,7 @@ static unlang_action_t CC_HINT(nonnull) mod_authorize(rlm_rcode_t *p_result, mod
 	rlm_files_t const *inst = talloc_get_type_abort_const(mctx->inst->data, rlm_files_t);
 	rlm_files_env_t *env_data = talloc_get_type_abort(mctx->env_data, rlm_files_env_t);
 
-	return file_common(p_result, inst, env_data, request, inst->filename,
+	return file_common(p_result, inst, env_data, request,
 			   inst->users ? inst->users : inst->common,
 			   inst->users ? inst->users_def : inst->common_def);
 }
@@ -644,7 +642,7 @@ static unlang_action_t CC_HINT(nonnull) mod_preacct(rlm_rcode_t *p_result, modul
 	rlm_files_t const *inst = talloc_get_type_abort_const(mctx->inst->data, rlm_files_t);
 	rlm_files_env_t *env_data = talloc_get_type_abort(mctx->env_data, rlm_files_env_t);
 
-	return file_common(p_result, inst, env_data, request, inst->acct_usersfile,
+	return file_common(p_result, inst, env_data, request,
 			   inst->acct_users ? inst->acct_users : inst->common,
 			   inst->acct_users ? inst->acct_users_def : inst->common_def);
 }
@@ -654,7 +652,7 @@ static unlang_action_t CC_HINT(nonnull) mod_authenticate(rlm_rcode_t *p_result, 
 	rlm_files_t const *inst = talloc_get_type_abort_const(mctx->inst->data, rlm_files_t);
 	rlm_files_env_t *env_data = talloc_get_type_abort(mctx->env_data, rlm_files_env_t);
 
-	return file_common(p_result, inst, env_data, request, inst->auth_usersfile,
+	return file_common(p_result, inst, env_data, request,
 			   inst->auth_users ? inst->auth_users : inst->common,
 			   inst->auth_users ? inst->auth_users_def : inst->common_def);
 }
@@ -664,7 +662,7 @@ static unlang_action_t CC_HINT(nonnull) mod_post_auth(rlm_rcode_t *p_result, mod
 	rlm_files_t const *inst = talloc_get_type_abort_const(mctx->inst->data, rlm_files_t);
 	rlm_files_env_t *env_data = talloc_get_type_abort(mctx->env_data, rlm_files_env_t);
 
-	return file_common(p_result, inst, env_data, request, inst->postauth_usersfile,
+	return file_common(p_result, inst, env_data, request,
 			   inst->postauth_users ? inst->postauth_users : inst->common,
 			   inst->postauth_users ? inst->postauth_users_def : inst->common_def);
 }
@@ -674,16 +672,16 @@ static unlang_action_t CC_HINT(nonnull) mod_post_auth(rlm_rcode_t *p_result, mod
  *	it is still evaluated during module instantiation to determine the tree type in use
  *	so more restructuring is needed to make the module protocol agnostic.
  */
-static const module_env_t module_env[] = {
-	{ FR_MODULE_ENV_OFFSET("key", FR_TYPE_VOID, rlm_files_env_t, key, "%{%{Stripped-User-Name}:-%{User-Name}}",
-			       T_DOUBLE_QUOTED_STRING, true, false, false) },
-	MODULE_ENV_TERMINATOR
+static const call_env_t call_env[] = {
+	{ FR_CALL_ENV_OFFSET("key", FR_TYPE_VOID, rlm_files_env_t, key, "%{%{Stripped-User-Name}:-%{User-Name}}",
+			     T_DOUBLE_QUOTED_STRING, true, false, false) },
+	CALL_ENV_TERMINATOR
 };
 
-static const module_method_env_t method_env = {
+static const call_method_env_t method_env = {
 	.inst_size = sizeof(rlm_files_env_t),
 	.inst_type = "rlm_files_env_t",
-	.env = module_env
+	.env = call_env
 };
 
 /* globally exported name */

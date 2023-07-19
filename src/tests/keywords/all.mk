@@ -63,22 +63,38 @@ endif
 #  update-remove-index		used to do???, now is parse-time error
 #  update-filter		lots of errors
 #
+
+#  Tests for the "update" keyword
 KEYWORD_UPDATE_TESTS := update-attr-ref-null update-error-3 update-group-error update-null-value-assign update-remove-index update-filter
 
+# Tests for rewriting "udpate"
 KEYWORD_UPDATE_REWRITE_TESTS := update-all update-array update-delete update-remove-any update-group update-hex update-remove-value update-index update-list-error update-remove-list update-prepend unknown-update  update-error update-error-2 update-exec-error update-list-null-rhs update-exec
+
+# Tests which can use new conditions, but which can't use tmpl_tokenize_all_nested=yes
+KEYWORD_UPDATE_TMPL_TESTS	:= foreach-regex xlat-dhcpv4
 
 #
 #  Migration support.  Some of the tests don't run under the new
 #  conditions, so we don't run them under the new conditions.
 #
 ifneq "$(findstring ${1}, paircmp if-paircmp)" ""
-$(OUTPUT)/${1}: NEW_COND=-S parse_new_conditions=no -S use_new_conditions=no
+$(OUTPUT)/${1}: NEW_COND=-S use_new_conditions=no
+
 else ifneq "$(findstring ${1}, comments update-to-edit if-regex-multivalue smash wimax unknown $(KEYWORD_UPDATE_TESTS) vendor_specific vendor_specific.raw xlat-unknown update-proto update-proto-error)" ""
-$(OUTPUT)/${1}: NEW_COND=-S parse_new_conditions=yes -S use_new_conditions=yes
+$(OUTPUT)/${1}: NEW_COND=-S use_new_conditions=yes
+
 else ifneq "$(findstring ${1}, $(KEYWORD_UPDATE_REWRITE_TESTS))" ""
-$(OUTPUT)/${1}: NEW_COND=-S parse_new_conditions=yes -S use_new_conditions=yes -S rewrite_update=yes
+$(OUTPUT)/${1}: NEW_COND=-S use_new_conditions=yes -S rewrite_update=yes
+
+else ifneq "$(findstring ${1}, $(KEYWORD_UPDATE_TMPL_TESTS))" ""
+$(OUTPUT)/${1}: NEW_COND=-S use_new_conditions=yes -S forbid_update=yes
+
 else
-$(OUTPUT)/${1}: NEW_COND=-S parse_new_conditions=yes -S use_new_conditions=yes -S forbid_update=yes
+$(OUTPUT)/${1}: NEW_COND=-S use_new_conditions=yes -S forbid_update=yes -S tmpl_tokenize_all_nested=yes -S pair_legacy_nested=true
+
+ifeq "${1}" "mschap"
+$(OUTPUT)/${1}: $(BUILD_DIR)/lib/rlm_mschap.la
+endif
 endif
 
 endef

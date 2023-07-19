@@ -411,11 +411,11 @@ static inline CC_HINT(nonnull(1), always_inline)
 void fr_value_box_init(fr_value_box_t *vb, fr_type_t type, fr_dict_attr_t const *enumv, bool tainted)
 {
 	/* coverity[store_writes_const_field] */
-	memcpy(vb, &(fr_value_box_t){
+	memcpy((void *) vb, &(fr_value_box_t){
 	       		.type = type,
 			.enumv = enumv,
 			.tainted = tainted
-	       }, sizeof(*vb));
+		}, sizeof(*vb));
 	fr_value_box_list_entry_init(vb);
 
 	/*
@@ -556,6 +556,7 @@ static inline CC_HINT(nonnull(2))
 fr_value_box_t *fr_value_box_acopy(TALLOC_CTX *ctx, fr_value_box_t const *src)
 {
 	fr_value_box_t *vb = fr_value_box_alloc_null(ctx);
+	if (unlikely(!vb)) return NULL;
 
 	if ((unlikely(fr_value_box_copy(vb, vb, src) < 0))) {
 		talloc_free(vb);
@@ -1031,7 +1032,7 @@ ssize_t		fr_value_box_from_str(TALLOC_CTX *ctx, fr_value_box_t *dst,
  */
 ssize_t 	fr_value_box_list_concat_as_string(bool *tainted, fr_sbuff_t *sbuff, fr_value_box_list_t *list,
 					   	  char const *sep, size_t sep_len, fr_sbuff_escape_rules_t const *e_rules,
-					   	  fr_value_box_list_action_t proc_action, bool flatten, bool printable)
+					   	  fr_value_box_list_action_t proc_action, bool flatten)
 		CC_HINT(nonnull(2,3));
 
 ssize_t		fr_value_box_list_concat_as_octets(bool *tainted, fr_dbuff_t *dbuff, fr_value_box_list_t *list,

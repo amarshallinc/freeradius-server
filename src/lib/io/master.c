@@ -53,7 +53,7 @@ typedef struct {
  *
  */
 typedef struct {
-	int			heap_id;
+	fr_heap_index_t		heap_id;
 	uint32_t		priority;
 	fr_time_t		recv_time;
 	fr_io_track_t		*track;
@@ -74,6 +74,22 @@ typedef enum {
 	PR_CLIENT_PENDING,				//!< dynamic client pending definition
 } fr_io_client_state_t;
 
+/*
+ *	Dynamic clients are run through the normal src/process/foo state machine.
+ *
+ *	request->async->packet_ctx is an fr_io_track_t
+ *
+ *	track->dynamic is set to a non-zero value.
+ *
+ *	The dynamic client code returns a buffer of 1 byte for a NAK.
+ *
+ *	If the client creation is successful, then it does talloc(NULL, fr_client_t),
+ *	fills out the structure, and sends the pointer in the buffer (8 bytes).
+ *
+ *	This code will take over ownership of the structure, and
+ *	create the dynamic client.
+ */
+
 typedef struct fr_io_connection_s fr_io_connection_t;
 
 /** Client definitions for master IO
@@ -87,8 +103,8 @@ struct fr_io_client_s {
 	fr_client_t			*radclient;	//!< old-style definition of this client
 
 	int				packets;	//!< number of packets using this client
-	int				pending_id;	//!< for pending clients
-	int				alive_id;	//!< for all clients
+	fr_heap_index_t			pending_id;	//!< for pending clients
+	fr_heap_index_t			alive_id;	//!< for all clients
 
 	bool				use_connected;	//!< does this client allow connected sub-sockets?
 	bool				ready_to_delete; //!< are we ready to delete this client?
@@ -492,7 +508,8 @@ static fr_io_connection_t *fr_io_connection_alloc(fr_io_instance_t const *inst,
 				(void) fr_trie_walk(thread->trie, &thread->num_connections, count_connections);
 
 				if ((thread->num_connections + 1) >= max_connections) {
-					DEBUG("Too many open connections.  Ignoring dynamic client %s.  Discarding packet.", client->radclient->shortname);
+					DEBUG("proto_%s - Ignoring connection from client %s - 'max_connections' limit reached.",
+					      inst->app->common.name, client->radclient->shortname);
 				close_and_return:
 					if (fd >= 0) close(fd);
 					return NULL;
@@ -537,8 +554,8 @@ static fr_io_connection_t *fr_io_connection_alloc(fr_io_instance_t const *inst,
 	talloc_set_destructor(connection->client, _client_free);
 	talloc_set_destructor(connection, connection_free);
 
-	connection->client->pending_id = -1;
-	connection->client->alive_id = -1;
+	connection->client->pending_id = FR_HEAP_INDEX_INVALID;
+	connection->client->alive_id = FR_HEAP_INDEX_INVALID;
 	connection->client->connection = connection;
 
 	/*
@@ -688,7 +705,7 @@ static fr_io_connection_t *fr_io_connection_alloc(fr_io_instance_t const *inst,
 		fr_assert(inst->app_io->connection_set != NULL);
 
 		if (inst->app_io->connection_set(connection->child, connection->address) < 0) {
-			DEBUG("Failed setting connection for socket.");
+			DEBUG("proto_%s - Failed setting connection for socket.", inst->app->common.name);
 			goto cleanup;
 		}
 
@@ -702,7 +719,7 @@ static fr_io_connection_t *fr_io_connection_alloc(fr_io_instance_t const *inst,
 			struct sockaddr_storage src;
 
 			if (inst->app_io->open(connection->child) < 0) {
-				DEBUG("Failed opening connected socket.");
+				DEBUG("proto_%s - Failed opening connected socket.", inst->app->common.name);
 				talloc_free(dl_inst);
 				return NULL;
 			}
@@ -712,13 +729,13 @@ static fr_io_connection_t *fr_io_connection_alloc(fr_io_instance_t const *inst,
 			if (fr_ipaddr_to_sockaddr(&src, &salen,
 						  &connection->address->socket.inet.src_ipaddr,
 						  connection->address->socket.inet.src_port) < 0) {
-				DEBUG("Failed getting IP address");
+				DEBUG("proto_%s - Failed getting IP address", inst->app->common.name);
 				talloc_free(dl_inst);
 				return NULL;
 			}
 
 			if (connect(fd, (struct sockaddr *) &src, salen) < 0) {
-				ERROR("Failed in connect: %s", fr_syserror(errno));
+				ERROR("proto_%s - Failed in connect: %s", inst->app->common.name, fr_syserror(errno));
 				goto cleanup;
 			}
 		} else {
@@ -738,7 +755,7 @@ static fr_io_connection_t *fr_io_connection_alloc(fr_io_instance_t const *inst,
 		if (!inst->app_io->get_name) {
 			connection->name = fr_asprintf(connection, "proto_%s from client %pV port "
 						       "%u to server %pV port %u",
-						       inst->app_io->common.name,
+						       inst->app->common.name,
 						       fr_box_ipaddr(connection->address->socket.inet.src_ipaddr),
 						       connection->address->socket.inet.src_port,
 						       fr_box_ipaddr(connection->address->socket.inet.dst_ipaddr),
@@ -967,7 +984,7 @@ static fr_io_client_t *client_alloc(TALLOC_CTX *ctx, fr_io_client_state_t state,
 	 *	them up.
 	 */
 	(void) fr_heap_insert(&thread->alive_clients, client);
-	client->pending_id = -1;
+	client->pending_id = FR_HEAP_INDEX_INVALID;
 
 	/*
 	 *	Now that we've inserted it into the heap and
@@ -1208,7 +1225,7 @@ static int8_t alive_client_cmp(void const *one, void const *two)
  *  The app_io->read does the transport-specific data read.
  */
 static ssize_t mod_read(fr_listen_t *li, void **packet_ctx, fr_time_t *recv_time_p,
-			uint8_t *buffer, size_t buffer_len, size_t *leftover, uint32_t *priority, bool *is_dup)
+			uint8_t *buffer, size_t buffer_len, size_t *leftover)
 {
 	fr_io_instance_t const	*inst;
 	fr_io_thread_t		*thread;
@@ -1221,9 +1238,7 @@ static ssize_t mod_read(fr_listen_t *li, void **packet_ctx, fr_time_t *recv_time
 	fr_io_track_t		*track, *new_track;
 	fr_listen_t		*child;
 	int			value, accept_fd = -1;
-
-	fr_assert(is_dup != NULL);
-	*is_dup = false;
+	uint32_t		priority = PRIORITY_NORMAL;
 
 	get_inst(li, &inst, &thread, &connection, &child);
 
@@ -1295,7 +1310,6 @@ redo:
 		 */
 		*packet_ctx = track;
 		*leftover = 0;
-		*priority = pending->priority;
 		recv_time = *recv_time_p = pending->recv_time;
 		client = track->client;
 
@@ -1334,8 +1348,8 @@ redo:
 		 *	OK.  So don't return -1.
 		 */
 		if (accept_fd < 0) {
-			DEBUG("proto_%s_%s - failed to accept new socket: %s",
-			      inst->app->common.name, inst->transport, fr_syserror(errno));
+			DEBUG("proto_%s - failed to accept new socket: %s",
+			      inst->app->common.name, fr_syserror(errno));
 			return 0;
 		}
 
@@ -1391,7 +1405,7 @@ do_read:
 		 *	functions which do all of the TLS work.
 		 */
 		packet_len = inst->app_io->read(child, (void **) &local_address, &recv_time,
-					  buffer, buffer_len, leftover, priority, is_dup);
+					  buffer, buffer_len, leftover);
 		if (packet_len <= 0) {
 			return packet_len;
 		}
@@ -1414,9 +1428,7 @@ do_read:
 				       inst->app_io->common.name, fr_box_ipaddr(address.socket.inet.src_ipaddr));
 				return 0;
 			}
-			*priority = value;
-		} else {
-			*priority = PRIORITY_NORMAL;
+			priority = value;
 		}
 
 		/*
@@ -1569,7 +1581,9 @@ have_client:
 		 *	"live" packets.
 		 */
 		if (!track) {
-			track = fr_io_track_add(client, &address, buffer, packet_len, recv_time, is_dup);
+			bool	is_dup = false;
+
+			track = fr_io_track_add(client, &address, buffer, packet_len, recv_time, &is_dup);
 			if (!track) {
 				DEBUG("Failed tracking packet from client %s - discarding it",
 				      client->radclient->shortname);
@@ -1579,7 +1593,7 @@ have_client:
 			/*
 			 *	If there's a cached reply, just send that and don't do anything else.
 			 */
-			if (*is_dup) {
+			if (is_dup) {
 				fr_network_t *nr;
 
 				if (track->do_not_respond) {
@@ -1649,7 +1663,7 @@ have_client:
 			 *	Allocate the pending packet structure.
 			 */
 			pending = fr_io_pending_alloc(client, buffer, packet_len,
-						      track, *priority);
+						      track, priority);
 			if (!pending) {
 				DEBUG("Failed tracking packet from client %pV - discarding packet", fr_box_ipaddr(client->src_ipaddr));
 				goto done;
@@ -2379,7 +2393,7 @@ static ssize_t mod_write(fr_listen_t *li, void *packet_ctx, fr_time_t request_ti
 		     (radclient->ipaddr.prefix != 32)) ||
 		    ((radclient->ipaddr.af == AF_INET6) &&
 		     (radclient->ipaddr.prefix != 128))) {
-			ERROR("prot_radius - Cannot define a dynamic client as a network");
+			ERROR("Cannot define a dynamic client as a network");
 
 		error:
 			talloc_free(radclient);
@@ -2513,7 +2527,7 @@ static ssize_t mod_write(fr_listen_t *li, void *packet_ctx, fr_time_t request_ti
 							   fr_io_client_t, pending_id, 0));
 	}
 
-	fr_assert(client->pending_id < 0);
+	fr_assert(!fr_heap_entry_inserted((client->pending_id)));
 	(void) fr_heap_insert(&thread->pending_clients, client);
 
 finish:
@@ -2623,40 +2637,33 @@ static int mod_bootstrap(module_inst_ctx_t const *mctx)
 		inst->app_io->network_get(inst->app_io_instance, &inst->ipproto, &inst->dynamic_clients, &inst->networks);
 	}
 
-	/*
-	 *	The caller determines if we have dynamic clients.
-	 */
-	if (inst->dynamic_clients) {
-		/*
-		 *	Load proto_dhcpv4_dynamic_client
-		 */
-		if (dl_module_instance(conf, &inst->dynamic_submodule,
-				       inst->dl_inst,
-				       DL_MODULE_TYPE_SUBMODULE, inst->app->common.name, "dynamic_client") < 0) {
-			cf_log_err(conf, "Failed finding proto_%s_dynamic_client", inst->app->common.name);
-			return -1;
-		}
-
-		if (dl_module_conf_parse(inst->dynamic_submodule, conf) < 0) {
-			TALLOC_FREE(inst->dynamic_submodule);
-			return -1;
-		}
-
-		fr_assert(inst->dynamic_submodule != NULL);
-
-		/*
-		 *	Don't bootstrap the dynamic submodule.  We're
-		 *	not even sure what that means...
-		 *
-		 *	@todo - maybe register the sections in
-		 *	app_process->compile_list?
-		 */
-	}
-
 	if ((inst->ipproto == IPPROTO_TCP) && !inst->app_io->connection_set) {
 		cf_log_err(inst->app_io_conf, "Missing 'connection set' API for proto_%s", inst->app_io->common.name);
 		return -1;
 	}
+
+	/*
+	 *	Ensure that the dynamic client sections exist
+	 */
+	if (inst->dynamic_clients) {
+		CONF_SECTION *server = cf_item_to_section(cf_parent(conf));
+
+		if (!cf_section_find(server, "new", "client")) {
+			cf_log_err(conf, "Cannot use 'dynamic_clients = yes' as the virtual server has no 'new client { ... }' section defined.");
+			return -1;
+		}
+
+		if (!cf_section_find(server, "add", "client")) {
+			cf_log_err(conf, "Cannot use 'dynamic_clients = yes' as the virtual server has no 'add client { ... }' section defined.");
+			return -1;
+		}
+
+		if (!cf_section_find(server, "deny", "client")) {
+			cf_log_err(conf, "Cannot use 'dynamic_clients = yes' as the virtual server has no 'deny client { ... }' section defined.");
+			return -1;
+		}
+	}
+
 
 	return 0;
 }
@@ -2687,46 +2694,6 @@ static int mod_instantiate(module_inst_ctx_t const *mctx)
 	    (inst->app_io->common.instantiate(MODULE_INST_CTX(inst->submodule)) < 0)) {
 		cf_log_err(conf, "Instantiation failed for \"proto_%s\"", inst->app_io->common.name);
 		return -1;
-	}
-
-	/*
-	 *	Instantiate the dynamic client processor.
-	 */
-	if (inst->dynamic_clients) {
-		fr_app_worker_t const	*app_process;
-
-		if (!inst->dynamic_submodule) {
-			cf_log_err(conf, "Instantiation failed for \"proto_%s\" - there is no way to define dynamic clients", inst->app_io->common.name);
-			return -1;
-		}
-
-		app_process = (fr_app_worker_t const *) inst->dynamic_submodule->module->common;
-
-		/*
-		 *	Compile the processing sections if the compile
-		 *	list exists.
-		 *
-		 *	Note that we don't register these sections.
-		 *	Maybe we should?
-		 */
-		if (app_process->compile_list) {
-			tmpl_rules_t	parse_rules = {
-				.attr = {
-					.dict_def = virtual_server_dict_by_name(cf_section_name2(inst->server_cs)),
-					.list_def = request_attr_request
-				}
-			};
-
-			if (virtual_server_compile_sections(inst->server_cs, app_process->compile_list,
-							    &parse_rules, inst->dynamic_submodule->data) < 0) {
-				return -1;
-			};
-		}
-
-		if (app_process->common.instantiate && (app_process->common.instantiate(MODULE_INST_CTX(inst->dynamic_submodule)) < 0)) {
-			cf_log_err(conf, "Instantiation failed for \"%s\"", app_process->common.name);
-			return -1;
-		}
 	}
 
 	return 0;

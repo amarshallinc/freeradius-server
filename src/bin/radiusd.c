@@ -38,6 +38,7 @@ RCSID("$Id$")
 #include <freeradius-devel/server/virtual_servers.h>
 #include <freeradius-devel/util/debug.h>
 #include <freeradius-devel/util/size.h>
+#include <freeradius-devel/util/strerror.h>
 
 #include <freeradius-devel/tls/base.h>
 #include <freeradius-devel/tls/log.h>
@@ -839,7 +840,6 @@ int main(int argc, char *argv[])
 		COPY(max_request_time);
 		COPY(unflatten_after_decode);
 		COPY(unflatten_before_encode);
-		COPY(flatten_before_encode);
 
 		/*
 		 *	Single server mode: use the global event list.
@@ -850,6 +850,10 @@ int main(int argc, char *argv[])
 			el = main_loop_event_list();
 		}
 
+		/*
+		 *	Fix spurious messages
+		 */
+		fr_strerror_clear();
 		sc = fr_schedule_create(NULL, el, &default_log, fr_debug_lvl,
 					thread_instantiate, thread_detach, schedule);
 		if (!sc) {
@@ -1106,6 +1110,13 @@ cleanup:
 	if (config) talloc_memory_report = config->talloc_memory_report;	/* Grab this before we free the config */
 
 	/*
+	 *	Virtual servers need to be freed before modules
+	 *	as state entries containing data with module-specific
+	 *	destructors may exist.
+	 */
+	virtual_servers_free();
+
+	/*
 	 *	Free modules, this needs to be done explicitly
 	 *	because some libraries used by modules use atexit
 	 *	handlers registered after ours, and they may deinit
@@ -1113,11 +1124,6 @@ cleanup:
 	 *	crashes on exit.
 	 */
 	modules_rlm_free();
-
-	/*
-	 *	Same with virtual servers and proto modules.
-	 */
-	virtual_servers_free();
 
 	/*
 	 *  And now nothing should be left anywhere except the

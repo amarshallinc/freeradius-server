@@ -24,27 +24,33 @@ TEST := test.process
 #
 #  We're left with a set of files to run the tests on.
 #
-FILES := $(filter-out %.ignore %.conf %.md %.attrs %.mk %~ %.rej,$(subst $(DIR)/,,$(wildcard $(patsubst %,$(DIR)/%/*,$(basename $(subst process_,,$(filter process%,$(ALL_TGTS))))))))
+PROTOCOLS := $(subst /server.conf,,$(subst $(DIR)/,,$(wildcard $(DIR)/*/server.conf)))
+FILES := $(filter-out %.ignore %.conf %.md %.attrs %.mk %~ %.rej,$(subst $(DIR)/,,$(wildcard $(patsubst %,$(DIR)/%/*,$(PROTOCOLS)))))
 
 $(eval $(call TEST_BOOTSTRAP))
 
-# -S parse_new_conditions=yes -S use_new_conditions=yes -S forbid_update=yes
+# -S use_new_conditions=yes -S forbid_update=yes
 
 #
 #  The dictionaries are in "share", because the server tries to load
 #  local dictionaries from "./dictionary".
 #
 src/tests/process/share/%: ${top_srcdir}/share/dictionary/%
-	@ln -sf $< $@
+	$(Q)ln -sf $< $@
 
+PROCESS_DICT := $(DIR)/share/freeradius
 ifneq "$(OPENSSL_LIBS)" ""
-PROCESS_DICT_TLS := $(DIR)/share/tls
+PROCESS_DICT += $(DIR)/share/tls
 endif
+
+PROCESS_DICT += $(patsubst %,$(DIR)/share/%,${PROTOCOLS})
 
 #
 #  For sheer laziness, allow "make test.process.foo"
 #
 define PROCESS_TEST
+test.process.$(patsubst %/,%,$(dir ${1})) : $(addprefix $(OUTPUT)/,${1})
+
 test.process.${1}: $(addprefix $(OUTPUT)/,${1})
 
 test.process.help: TEST_PROCESS_HELP += test.process.${1}
@@ -59,8 +65,8 @@ $(OUTPUT)/${1}: $(patsubst %,${BUILD_DIR}/lib/local/process_%.la,$(subst /,,$(di
 
 $(OUTPUT)/${1}: $(DIR)/$(subst /,,$(dir ${1}))/server.conf
 
-$(OUTPUT)/${1}: | $(DIR)/share/$(subst /,,$(dir ${1})) $(DIR)/share/freeradius $(PROCESS_DICT_TLS)
 endef
+
 $(foreach x,$(FILES),$(eval $(call PROCESS_TEST,$x)))
 
 #
@@ -85,14 +91,15 @@ $(foreach x,$(FILES),$(eval $(call PROCESS_TEST,$x)))
 #
 PROCESS_ARGS := -p test
 PROCESS_ARGS += -D $(DIR)/share -d $(DIR)/
-PROCESS_ARGS += -S parse_new_conditions=yes -S use_new_conditions=yes -S forbid_update=yes
+PROCESS_ARGS += -S use_new_conditions=yes -S forbid_update=yes
 PROCESS_ARGS += -i $(DIR)/test.attrs -f $(DIR)/test.attrs
 
-$(OUTPUT)/%: $(DIR)/% $(TEST_BIN_DIR)/unit_test_module $(DIR)/unit_test_module.conf
+$(OUTPUT)/%: $(DIR)/% $(PROCESS_DICT) $(TEST_BIN_DIR)/unit_test_module $(DIR)/unit_test_module.conf
+	$(eval PROTOCOL_NAME=$(lastword $(subst /, ,$(dir $(abspath $@)))))
 	$(eval CMD:=PROCESS=$< PROTOCOL=$(dir $<) $(TEST_BIN)/unit_test_module $(PROCESS_ARGS) -r "$@" -xx)
-	@echo PROCESS-TEST $(notdir $@)
-	@mkdir -p $(dir $@)
-	@if ! $(CMD) > "$@.log" 2>&1 || ! test -f "$@"; then \
+	@echo PROCESS-TEST $(PROTOCOL_NAME) $(notdir $@)
+	$(Q)mkdir -p $(dir $@)
+	$(Q)if ! $(CMD) > "$@.log" 2>&1 || ! test -f "$@"; then \
 		cat $@.log; \
 		echo "# $@.log"; \
 		echo $(CMD); \
@@ -100,7 +107,7 @@ $(OUTPUT)/%: $(DIR)/% $(TEST_BIN_DIR)/unit_test_module $(DIR)/unit_test_module.c
 	fi
 
 $(TEST):
-	@touch $(BUILD_DIR)/tests/$@
+	$(Q)touch $(BUILD_DIR)/tests/$@
 
 $(TEST).help:
-	@echo make $(TEST_PROCESS_HELP)
+	$(Q)echo make $(TEST_PROCESS_HELP)

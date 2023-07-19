@@ -481,7 +481,7 @@ int ldap_sync_entry_send(sync_state_t *sync, uint8_t const uuid[SYNC_UUID_LENGTH
 				if (values[i]->bv_len == 0) continue;
 
 				if (pair_append_by_tmpl_parent(sync_packet_ctx, &vp, pairs, map->lhs, true) < 0) break;
-				if (fr_value_box_from_str(vp, &vp->data, vp->da->type, NULL, values[i]->bv_val,
+				if (fr_value_box_from_str(vp, &vp->data, vp->vp_type, NULL, values[i]->bv_val,
 							  values[i]->bv_len, NULL, true) < 0) {
 					fr_pair_remove(pairs, vp);
 					talloc_free(vp);
@@ -593,8 +593,7 @@ static int proto_ldap_child_mod_close(fr_listen_t *li)
  *     addition to their other data.
  */
 static ssize_t proto_ldap_child_mod_read(fr_listen_t *li, UNUSED void **packet_ctx, UNUSED fr_time_t *recv_time_p, UNUSED uint8_t *buffer,
-					 UNUSED size_t buffer_len, UNUSED size_t *leftover, UNUSED uint32_t *priority,
-					 UNUSED bool *is_dup)
+					 UNUSED size_t buffer_len, UNUSED size_t *leftover)
 {
 	proto_ldap_sync_ldap_thread_t	*thread = talloc_get_type_abort(li->thread_instance, proto_ldap_sync_ldap_thread_t);
 	fr_ldap_connection_t		*conn = talloc_get_type_abort(thread->conn->h, fr_ldap_connection_t);

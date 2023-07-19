@@ -33,8 +33,11 @@
 #include <freeradius-devel/server/state.h>
 
 #include <freeradius-devel/unlang/module.h>
+#include <freeradius-devel/unlang/interpret.h>
 
 #include <freeradius-devel/util/debug.h>
+#include <freeradius-devel/util/pair.h>
+#include <freeradius-devel/util/value.h>
 
 static fr_dict_t const *dict_freeradius;
 static fr_dict_t const *dict_radius;
@@ -56,6 +59,7 @@ static fr_dict_attr_t const *attr_calling_station_id;
 static fr_dict_attr_t const *attr_chap_password;
 static fr_dict_attr_t const *attr_nas_port;
 static fr_dict_attr_t const *attr_packet_type;
+static fr_dict_attr_t const *attr_proxy_state;
 static fr_dict_attr_t const *attr_service_type;
 static fr_dict_attr_t const *attr_state;
 static fr_dict_attr_t const *attr_user_name;
@@ -74,6 +78,7 @@ fr_dict_attr_autoload_t process_radius_dict_attr[] = {
 	{ .out = &attr_calling_station_id, .name = "Calling-Station-Id", .type = FR_TYPE_STRING, .dict = &dict_radius },
 	{ .out = &attr_chap_password, .name = "CHAP-Password", .type = FR_TYPE_OCTETS, .dict = &dict_radius },
 	{ .out = &attr_nas_port, .name = "NAS-Port", .type = FR_TYPE_UINT32, .dict = &dict_radius },
+	{ .out = &attr_proxy_state, .name = "Proxy-State", .type = FR_TYPE_OCTETS, .dict = &dict_radius },
 	{ .out = &attr_packet_type, .name = "Packet-Type", .type = FR_TYPE_UINT32, .dict = &dict_radius },
 	{ .out = &attr_service_type, .name = "Service-Type", .type = FR_TYPE_UINT32, .dict = &dict_radius },
 	{ .out = &attr_state, .name = "State", .type = FR_TYPE_OCTETS, .dict = &dict_radius },
@@ -122,6 +127,10 @@ typedef struct {
 
 	CONF_SECTION	*do_not_respond;
 	CONF_SECTION	*protocol_error;	/* @todo - allow protocol error as a reject reply? */
+
+	CONF_SECTION	*new_client;
+	CONF_SECTION	*add_client;
+	CONF_SECTION	*deny_client;
 } process_radius_sections_t;
 
 typedef struct {
@@ -152,6 +161,13 @@ typedef struct {
 	process_radius_auth_t		auth;		//!< Authentication configuration.
 } process_radius_t;
 
+/** Records fields from the original request so we have a known good copy
+ */
+typedef struct {
+	fr_value_box_list_head_t	proxy_state;	//!< These need to be copied into the response in exactly
+							///< the same order as they were added.
+} process_radius_request_pairs_t;
+
 #define FR_RADIUS_PROCESS_CODE_VALID(_x) (FR_RADIUS_PACKET_CODE_VALID(_x) || (_x == FR_RADIUS_CODE_DO_NOT_RESPOND))
 
 #define PROCESS_PACKET_TYPE		fr_radius_packet_code_t
@@ -159,6 +175,7 @@ typedef struct {
 #define PROCESS_CODE_DO_NOT_RESPOND	FR_RADIUS_CODE_DO_NOT_RESPOND
 #define PROCESS_PACKET_CODE_VALID	FR_RADIUS_PROCESS_CODE_VALID
 #define PROCESS_INST			process_radius_t
+#define PROCESS_CODE_DYNAMIC_CLIENT	FR_RADIUS_CODE_ACCESS_ACCEPT
 #include <freeradius-devel/server/process.h>
 
 static const CONF_PARSER session_config[] = {
@@ -359,6 +376,99 @@ static void CC_HINT(format (printf, 4, 5)) auth_message(process_radius_auth_t co
 	talloc_free(msg);
 }
 
+/** Keep a copy of some attributes to keep them from being tamptered with
+ *
+ */
+static inline CC_HINT(always_inline)
+process_radius_request_pairs_t *radius_request_pairs_store(request_t *request)
+{
+	fr_pair_t			*proxy_state;
+	process_radius_request_pairs_t	*rctx;
+
+	/*
+	 *	Don't bother allocing the struct if there's no proxy state to store
+	 */
+	proxy_state = fr_pair_find_by_da(&request->request_pairs, NULL, attr_proxy_state);
+	if (!proxy_state) return 0;
+
+	MEM(rctx = talloc_zero(unlang_interpret_frame_talloc_ctx(request), process_radius_request_pairs_t));
+	fr_value_box_list_init(&rctx->proxy_state);
+
+	/*
+	 *	We don't use fr_pair_list_copy_by_da, to avoid doing the lookup for
+	 *	the first proxy-state attr again.
+	 */
+	do {
+		fr_value_box_t *proxy_state_value;
+
+		MEM((proxy_state_value = fr_value_box_acopy(rctx, &proxy_state->data)));
+		fr_value_box_list_insert_tail(&rctx->proxy_state, proxy_state_value);
+	} while ((proxy_state = fr_pair_find_by_da(&request->request_pairs, proxy_state, attr_proxy_state)));
+
+	return rctx;
+}
+
+static inline CC_HINT(always_inline)
+void radius_request_pairs_to_reply(request_t *request, process_radius_request_pairs_t *rctx)
+{
+	if (!rctx) return;
+
+	/*
+	 *	Proxy-State is a link-level signal between RADIUS
+	 *	client and server.  RFC 2865 Section 5.33 says that
+	 *	Proxy-State is an opaque field, and implementations
+	 *	most not examine it, interpret it, or assign it any
+	 *	meaning.  Implementations must also copy all Proxy-State
+	 *	from the request to the reply.
+	 *
+	 *	The rlm_radius module already deletes any Proxy-State
+	 *	from the reply before appending the proxy reply to the
+	 *	current reply.
+	 *
+	 *	If any policy creates Proxy-State, that could affect
+	 *	individual RADIUS links (perhaps), and that would be
+	 *	wrong.  As such, we nuke any nonsensical Proxy-State
+	 *	added by policies or errant modules, and instead just
+	 *	do exactly what the RFCs require us to do.  No more.
+	 */
+	fr_pair_delete_by_da(&request->reply_pairs, attr_proxy_state);
+
+	RDEBUG3("Adding Proxy-State attributes from request");
+	RINDENT();
+	fr_value_box_list_foreach(&rctx->proxy_state, proxy_state_value) {
+		fr_pair_t *vp;
+
+		MEM(vp = fr_pair_afrom_da(request->reply_ctx, attr_proxy_state));
+		fr_value_box_copy(vp, &vp->data, proxy_state_value);
+		fr_pair_append(&request->reply_pairs, vp);
+		RDEBUG3("&reply.%pP", vp);
+	}
+	REXDENT();
+}
+
+/** A wrapper around recv generic which stores fields from the request
+ */
+RECV(generic_radius_request)
+{
+	module_ctx_t			our_mctx = *mctx;
+
+	fr_assert_msg(!mctx->rctx, "rctx not expected here");
+	our_mctx.rctx = radius_request_pairs_store(request);
+	mctx = &our_mctx;	/* Our mutable mctx */
+
+	return CALL_RECV(generic);
+}
+
+/** A wrapper around send generic which restores fields
+ *
+ */
+RESUME(generic_radius_response)
+{
+	if (mctx->rctx) radius_request_pairs_to_reply(request, talloc_get_type_abort(mctx->rctx, process_radius_request_pairs_t));
+
+	return CALL_RESUME(send_generic);
+}
+
 RECV(access_request)
 {
 	process_radius_t const		*inst = talloc_get_type_abort_const(mctx->inst->data, process_radius_t);
@@ -372,7 +482,7 @@ RECV(access_request)
 		return CALL_SEND_TYPE(FR_RADIUS_CODE_ACCESS_REJECT);
 	}
 
-	return CALL_RECV(generic);
+	return CALL_RECV(generic_radius_request);
 }
 
 RESUME(auth_type);
@@ -584,7 +694,7 @@ RESUME(auth_type)
 	return state->send(p_result, mctx, request);
 }
 
-RESUME_NO_RCTX(access_accept)
+RESUME(access_accept)
 {
 	fr_pair_t			*vp;
 	process_radius_t const		*inst = talloc_get_type_abort_const(mctx->inst->data, process_radius_t);
@@ -614,10 +724,11 @@ RESUME_NO_RCTX(access_accept)
 	}
 
 	fr_state_discard(inst->auth.state_tree, request);
+	radius_request_pairs_to_reply(request, mctx->rctx);
 	RETURN_MODULE_OK;
 }
 
-RESUME_NO_RCTX(access_reject)
+RESUME(access_reject)
 {
 	fr_pair_t			*vp;
 	process_radius_t const		*inst = talloc_get_type_abort_const(mctx->inst->data, process_radius_t);
@@ -632,6 +743,7 @@ RESUME_NO_RCTX(access_reject)
 	}
 
 	fr_state_discard(inst->auth.state_tree, request);
+	radius_request_pairs_to_reply(request, mctx->rctx);
 	RETURN_MODULE_OK;
 }
 
@@ -651,6 +763,7 @@ RESUME(access_challenge)
 	}
 
 	fr_assert(request->reply->code == FR_RADIUS_CODE_ACCESS_CHALLENGE);
+	radius_request_pairs_to_reply(request, mctx->rctx);
 	RETURN_MODULE_OK;
 }
 
@@ -697,7 +810,7 @@ RESUME(accounting_request)
 	rlm_rcode_t			rcode = *p_result;
 	fr_pair_t			*vp;
 	CONF_SECTION			*cs;
-	fr_dict_enum_value_t const		*dv;
+	fr_dict_enum_value_t const	*dv;
 	fr_process_state_t const	*state;
 	process_radius_t const		*inst = talloc_get_type_abort_const(mctx->inst->data, process_radius_t);
 
@@ -769,7 +882,7 @@ RESUME(protocol_error)
 	/*
 	 *	https://tools.ietf.org/html/rfc7930#section-4
 	 */
-	vp = fr_pair_find_by_da(&request->reply_pairs, NULL, attr_original_packet_code);
+	vp = fr_pair_find_by_da_nested(&request->reply_pairs, NULL, attr_original_packet_code);
 	if (!vp) {
 		vp = fr_pair_afrom_da(request->reply_ctx, attr_original_packet_code);
 		if (vp) {
@@ -804,15 +917,24 @@ static unlang_action_t mod_process(rlm_rcode_t *p_result, module_ctx_t const *mc
 
 	PROCESS_TRACE;
 
-	fr_assert(FR_RADIUS_PACKET_CODE_VALID(request->packet->code));
-
 	request->component = "radius";
 	request->module = NULL;
 	fr_assert(request->dict == dict_radius);
 
+	fr_assert(FR_RADIUS_PACKET_CODE_VALID(request->packet->code));
+
 	UPDATE_STATE(packet);
 
+	if (!state->recv) {
+		REDEBUG("Invalid packet type (%u)", request->packet->code);
+		RETURN_MODULE_FAIL;
+	}
+
 	radius_packet_debug(request, request->packet, &request->request_pairs, true);
+
+	if (unlikely(request_is_dynamic_client(request))) {
+		return new_client(p_result, mctx, request);
+	}
 
 	return state->recv(p_result, mctx, request);
 }
@@ -908,7 +1030,7 @@ static fr_process_state_t const process_state[] = {
 			[RLM_MODULE_DISALLOW]	= FR_RADIUS_CODE_DO_NOT_RESPOND
 		},
 		.rcode = RLM_MODULE_NOOP,
-		.recv = recv_generic,
+		.recv = recv_generic_radius_request,
 		.resume = resume_accounting_request,
 		.section_offset = offsetof(process_radius_sections_t, accounting_request),
 	},
@@ -922,7 +1044,7 @@ static fr_process_state_t const process_state[] = {
 		},
 		.rcode = RLM_MODULE_NOOP,
 		.send = send_generic,
-		.resume = resume_send_generic,
+		.resume = resume_generic_radius_response,
 		.section_offset = offsetof(process_radius_sections_t, accounting_response),
 	},
 	[ FR_RADIUS_CODE_STATUS_SERVER ] = { /* @todo - negotiation, stats, etc. */
@@ -955,7 +1077,7 @@ static fr_process_state_t const process_state[] = {
 			[RLM_MODULE_DISALLOW]	= FR_RADIUS_CODE_COA_NAK
 		},
 		.rcode = RLM_MODULE_NOOP,
-		.recv = recv_generic,
+		.recv = recv_generic_radius_request,
 		.resume = resume_recv_generic,
 		.section_offset = offsetof(process_radius_sections_t, coa_request),
 	},
@@ -968,7 +1090,7 @@ static fr_process_state_t const process_state[] = {
 		},
 		.rcode = RLM_MODULE_NOOP,
 		.send = send_generic,
-		.resume = resume_send_generic,
+		.resume = resume_generic_radius_response,
 		.section_offset = offsetof(process_radius_sections_t, coa_ack),
 	},
 	[ FR_RADIUS_CODE_COA_NAK ] = {
@@ -980,7 +1102,7 @@ static fr_process_state_t const process_state[] = {
 		},
 		.rcode = RLM_MODULE_NOOP,
 		.send = send_generic,
-		.resume = resume_send_generic,
+		.resume = resume_generic_radius_response,
 		.section_offset = offsetof(process_radius_sections_t, coa_nak),
 	},
 	[ FR_RADIUS_CODE_DISCONNECT_REQUEST ] = {
@@ -996,8 +1118,8 @@ static fr_process_state_t const process_state[] = {
 			[RLM_MODULE_DISALLOW]	= FR_RADIUS_CODE_DISCONNECT_NAK
 		},
 		.rcode = RLM_MODULE_NOOP,
-		.recv = recv_generic,
-		.resume = resume_recv_generic,
+		.send = send_generic,
+		.resume = resume_generic_radius_response,
 		.section_offset = offsetof(process_radius_sections_t, disconnect_request),
 	},
 	[ FR_RADIUS_CODE_DISCONNECT_ACK ] = {
@@ -1009,7 +1131,7 @@ static fr_process_state_t const process_state[] = {
 		},
 		.rcode = RLM_MODULE_NOOP,
 		.send = send_generic,
-		.resume = resume_send_generic,
+		.resume = resume_generic_radius_response,
 		.section_offset = offsetof(process_radius_sections_t, disconnect_ack),
 	},
 	[ FR_RADIUS_CODE_DISCONNECT_NAK ] = {
@@ -1021,7 +1143,7 @@ static fr_process_state_t const process_state[] = {
 		},
 		.rcode = RLM_MODULE_NOOP,
 		.send = send_generic,
-		.resume = resume_send_generic,
+		.resume = resume_generic_radius_response,
 		.section_offset = offsetof(process_radius_sections_t, disconnect_nak),
 	},
 	[ FR_RADIUS_CODE_PROTOCOL_ERROR ] = { /* @todo - fill out required fields */
@@ -1158,6 +1280,9 @@ static virtual_server_compile_t const compile_list[] = {
 		.name2 = CF_IDENT_ANY,
 		.component = MOD_AUTHENTICATE
 	},
+
+	DYNAMIC_CLIENT_SECTIONS,
+
 	COMPILE_TERMINATOR
 };
 

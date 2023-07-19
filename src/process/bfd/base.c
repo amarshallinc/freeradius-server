@@ -139,7 +139,7 @@ RESUME_NO_MCTX(recv_bfd)
 			state = vp->vp_uint32;
 		} else {
 			vp = fr_pair_find_by_da(&request->reply_pairs, NULL, attr_bfd_packet);
-			if (vp) vp = fr_pair_find_by_da(&vp->vp_group, NULL, attr_bfd_state);
+			if (vp) vp = fr_pair_find_by_da_nested(&vp->vp_group, NULL, attr_bfd_state);
 			if (vp) state = vp->vp_uint8;
 		}
 	}
@@ -256,6 +256,11 @@ static unlang_action_t mod_process(rlm_rcode_t *p_result, module_ctx_t const *mc
 	fr_assert(wrapper->type == BFD_WRAPPER_RECV_PACKET);
 
 	UPDATE_STATE(packet);
+
+	if (!state->recv) {
+		REDEBUG("Invalid packet type (%u)", request->packet->code);
+		RETURN_MODULE_FAIL;
+	}
 
 	bfd_packet_debug(request, request->packet, &request->request_pairs, true);
 

@@ -57,7 +57,7 @@ static ssize_t encode_value(fr_dbuff_t *dbuff,
 	/*
 	 *	This has special requirements.
 	 */
-	if ((vp->da->type == FR_TYPE_STRUCT) || (da->type == FR_TYPE_STRUCT)) {
+	if ((vp->vp_type == FR_TYPE_STRUCT) || (da->type == FR_TYPE_STRUCT)) {
 		slen = fr_struct_to_network(&work_dbuff, da_stack, depth, cursor, encode_ctx, encode_value, NULL);
 		goto done;
 	}
@@ -108,7 +108,10 @@ ssize_t fr_bfd_encode(uint8_t *out, size_t outlen, UNUSED uint8_t const *origina
 	fr_dbuff_t		work_dbuff = FR_DBUFF_TMP(out, outlen);
 	fr_da_stack_t		da_stack;
 
-	fr_pair_dcursor_init(&cursor, vps);
+	if (!fr_pair_dcursor_by_ancestor_init(&cursor, vps, attr_bfd_packet)) {
+		fr_strerror_const("No BFD attributes found in the list");
+		return -1;
+	}
 
 	packet_ctx.secret = secret;
 

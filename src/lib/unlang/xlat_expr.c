@@ -687,7 +687,7 @@ static xlat_action_t xlat_regex_match(TALLOC_CTX *ctx, request_t *request, fr_va
 			 *	Concatenate everything, and escape untrusted inputs.
 			 */
 			if (fr_value_box_list_concat_as_string(NULL, agg, &list, NULL, 0, &regex_escape_rules,
-							       FR_VALUE_BOX_LIST_FREE_BOX, true, false) < 0) {
+							       FR_VALUE_BOX_LIST_FREE_BOX, true) < 0) {
 				RPEDEBUG("Failed concatenating regular expression string");
 				talloc_free(regmatch);
 				return XLAT_ACTION_FAIL;
@@ -760,7 +760,7 @@ static xlat_action_t xlat_regex_resume(TALLOC_CTX *ctx, fr_dcursor_t *out,
 	 *      concatenate it here.  We escape the various untrusted inputs.
 	 */
 	if (fr_value_box_list_concat_as_string(NULL, agg, &rctx->list, NULL, 0, &regex_escape_rules,
-					       FR_VALUE_BOX_LIST_FREE_BOX, true, false) < 0) {
+					       FR_VALUE_BOX_LIST_FREE_BOX, true) < 0) {
 		RPEDEBUG("Failed concatenating regular expression string");
 		return XLAT_ACTION_FAIL;
 	}
@@ -1192,6 +1192,7 @@ static xlat_action_t xlat_logical_resume(TALLOC_CTX *ctx, fr_dcursor_t *out,
 {
 	xlat_logical_inst_t const *inst = talloc_get_type_abort_const(xctx->inst, xlat_logical_inst_t);
 	xlat_logical_rctx_t	*rctx = talloc_get_type_abort(xctx->rctx, xlat_logical_rctx_t);
+	bool			match;
 
 	/*
 	 *	If one of the expansions fails, then we fail the
@@ -1208,7 +1209,8 @@ static xlat_action_t xlat_logical_resume(TALLOC_CTX *ctx, fr_dcursor_t *out,
 	 *
 	 *	(a, b, c) || (d, e, f) == a || b || c || d || e || f
 	 */
-	if (!xlat_logical_match(&rctx->box, &rctx->list, inst->stop_on_match)) {
+	match = xlat_logical_match(&rctx->box, &rctx->list, inst->stop_on_match);
+	if (!match) {
 		/*
 		 *	If nothing matches, we return a "false" box.
 		 */
@@ -1219,34 +1221,33 @@ static xlat_action_t xlat_logical_resume(TALLOC_CTX *ctx, fr_dcursor_t *out,
 		rctx->box->vb_bool = false;
 
 		/*
-		 *	Try for another match, if possible.
+		 *	we didn't match, (&&), so we're done.
 		 */
-		if (inst->stop_on_match) goto next;
-
-		/*
-		 *	Otherwise we stop on failure, with the boolean
-		 *	we just updated.
-		 */
-		goto done;
+		if (!inst->stop_on_match) goto done;
 	}
 
-	if (inst->stop_on_match) {
-	done:
-		fr_dcursor_append(out, rctx->box);
-
-		talloc_free(rctx);
-		return XLAT_ACTION_DONE;
-	}
-
-next:
 	fr_value_box_list_talloc_free(&rctx->list);
+
+	/*
+	 *	If we stop on the first match, and we got a "true" match we're done.
+	 */
+	if (inst->stop_on_match && match && fr_value_box_is_truthy(rctx->box)) goto done;
+
 	rctx->current++;
 
 	/*
 	 *	Nothing to expand, return the final value we saw.
 	 */
 	if (rctx->current >= inst->argc) {
-		goto done;
+	done:
+		/*
+		 *	Otherwise we stop on failure, with the boolean
+		 *	we just updated.
+		 */
+		fr_dcursor_append(out, rctx->box);
+
+		talloc_free(rctx);
+		return XLAT_ACTION_DONE;
 	}
 
 	return xlat_logical_process_arg(ctx, out, xctx, request, in);
@@ -1556,7 +1557,7 @@ static xlat_action_t xlat_exists_resume(TALLOC_CTX *ctx, fr_dcursor_t *out,
 	 *	concatenate it here.  We escape the various untrusted inputs.
 	 */
 	if (fr_value_box_list_concat_as_string(NULL, agg, &rctx->list, NULL, 0, NULL,
-					       FR_VALUE_BOX_LIST_FREE_BOX, true, true) < 0) {
+					       FR_VALUE_BOX_LIST_FREE_BOX, true) < 0) {
 		RPEDEBUG("Failed concatenating attribute name string");
 		return XLAT_ACTION_FAIL;
 	}

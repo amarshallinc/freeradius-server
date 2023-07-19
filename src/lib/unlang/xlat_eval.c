@@ -796,7 +796,7 @@ void xlat_signal(xlat_func_signal_t signal, xlat_exp_t const *exp,
 {
 	xlat_thread_inst_t *t = xlat_thread_instance_find(exp);
 
-	signal(XLAT_CTX(exp->call.inst, t->data, t->mctx, rctx), request, action);
+	signal(XLAT_CTX(exp->call.inst, t->data, t->mctx, NULL, rctx), request, action);
 }
 
 /** Call an xlat's resumption method
@@ -835,11 +835,11 @@ xlat_action_t xlat_frame_eval_resume(TALLOC_CTX *ctx, fr_dcursor_t *out,
 	VALUE_BOX_TALLOC_LIST_VERIFY(result);
 
 	if (node->type != XLAT_FUNC) {
-		xa = resume(ctx, out, XLAT_CTX(NULL, NULL, NULL, rctx), request, result);
+		xa = resume(ctx, out, XLAT_CTX(NULL, NULL, NULL, NULL, rctx), request, result);
 	} else {
 		xlat_thread_inst_t *t;
 		t = xlat_thread_instance_find(node);
-		xa = resume(ctx, out, XLAT_CTX(node->call.inst->data, t->data, t->mctx, rctx), request, result);
+		xa = resume(ctx, out, XLAT_CTX(node->call.inst->data, t->data, t->mctx, NULL, rctx), request, result);
 		VALUE_BOX_TALLOC_LIST_VERIFY(result);
 
 		RDEBUG2("| %%%c%s:...%c",
@@ -892,12 +892,13 @@ xlat_action_t xlat_frame_eval_resume(TALLOC_CTX *ctx, fr_dcursor_t *out,
  * @param[in] head		of the list to evaluate
  * @param[in,out] in		xlat node to evaluate.  Advanced as we process
  *				additional #xlat_exp_t.
+ * @param[in] env_data		Expanded call env.
  * @param[in] result		of a previous nested evaluation.
  */
 xlat_action_t xlat_frame_eval_repeat(TALLOC_CTX *ctx, fr_dcursor_t *out,
 				     xlat_exp_head_t const **child, bool *alternate,
 				     request_t *request, xlat_exp_head_t const *head, xlat_exp_t const **in,
-				     fr_value_box_list_t *result)
+				     void *env_data, fr_value_box_list_t *result)
 {
 	xlat_exp_t const	*node = *in;
 
@@ -941,7 +942,7 @@ xlat_action_t xlat_frame_eval_repeat(TALLOC_CTX *ctx, fr_dcursor_t *out,
 
 		VALUE_BOX_TALLOC_LIST_VERIFY(result);
 		xa = node->call.func->func(ctx, out,
-					   XLAT_CTX(node->call.inst->data, t->data, t->mctx, NULL),
+					   XLAT_CTX(node->call.inst->data, t->data, t->mctx, env_data, NULL),
 					   request, result);
 		VALUE_BOX_TALLOC_LIST_VERIFY(result);
 
@@ -1050,7 +1051,7 @@ xlat_action_t xlat_frame_eval_repeat(TALLOC_CTX *ctx, fr_dcursor_t *out,
 	case XLAT_TMPL:
 		fr_assert(tmpl_is_exec(node->vpt));
 
-		if (tmpl_eval_cast(ctx, result, node->vpt) < 0) {
+		if (tmpl_eval_cast_in_place(result, node->vpt) < 0) {
 			fr_value_box_list_talloc_free(result);
 			return XLAT_ACTION_FAIL;
 		}
@@ -1175,7 +1176,7 @@ xlat_action_t xlat_frame_eval(TALLOC_CTX *ctx, fr_dcursor_t *out, xlat_exp_head_
 				/*
 				 *	Cast the results if necessary.
 				 */
-				if (tmpl_eval_cast(ctx, &result, node->vpt) < 0) goto fail;
+				if (tmpl_eval_cast_in_place(&result, node->vpt) < 0) goto fail;
 
 				fr_value_box_list_move((fr_value_box_list_t *)out->dlist, &result);
 				continue;
@@ -1236,7 +1237,7 @@ xlat_action_t xlat_frame_eval(TALLOC_CTX *ctx, fr_dcursor_t *out, xlat_exp_head_
 
 			xlat_debug_log_expansion(request, node, NULL, __LINE__);
 			xa = node->call.func->func(ctx, out,
-						   XLAT_CTX(node->call.func->uctx, NULL, NULL, NULL),
+						   XLAT_CTX(node->call.func->uctx, NULL, NULL, NULL, NULL),
 						   request, NULL);
 			fr_dcursor_next(out);
 
@@ -1262,7 +1263,7 @@ xlat_action_t xlat_frame_eval(TALLOC_CTX *ctx, fr_dcursor_t *out, xlat_exp_head_
 			 *	If there's no children we can just
 			 *	call the function directly.
 			 */
-			xa = xlat_frame_eval_repeat(ctx, out, child, NULL, request, head, in, &result);
+			xa = xlat_frame_eval_repeat(ctx, out, child, NULL, request, head, in, NULL, &result);
 			if (xa != XLAT_ACTION_DONE || (!*in)) goto finish;
 			continue;
 
@@ -1453,11 +1454,18 @@ static ssize_t _xlat_eval_compiled(TALLOC_CTX *ctx, char **out, size_t outlen, r
 		return slen;
 	}
 
+	if ((size_t)slen >= outlen) {
+		fr_strerror_const("Insufficient output buffer space");
+		return -1;
+	}
+
 	/*
 	 *	Otherwise copy the talloced buffer to the fixed one.
 	 */
-	strlcpy(*out, buff, outlen);
+	memcpy(*out, buff, slen);
+	(*out)[slen] = '\0';
 	talloc_free(buff);
+
 	return slen;
 }
 

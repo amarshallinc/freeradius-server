@@ -57,11 +57,6 @@ typedef struct {
 typedef struct {
 	char const	*name;			//!< Name of the module instance
 	PyThreadState	*interpreter;		//!< The interpreter used for this instance of rlm_python.
-	char const	*python_path;		//!< Path to search for python files in.
-	bool		python_path_include_conf_dir;	//!< Include the directory of the current
-							///< rlm_python module config in the python path.
-	bool		python_path_include_default;	//!< Include the default python path
-							///< in the python path.
 	PyObject	*module;		//!< Local, interpreter specific module.
 
 	python_func_def_t
@@ -77,6 +72,14 @@ typedef struct {
 						//!< made available to the python script.
 } rlm_python_t;
 
+/** Global config for python library
+ *
+ */
+typedef struct {
+	char const	*path;			//!< Path to search for python files in.
+	bool		path_include_default;	//!< Include the default python path in `path`
+} libpython_global_config_t;
+
 /** Tracks a python module inst/thread state pair
  *
  * Multiple instances of python create multiple interpreters and each
@@ -91,7 +94,34 @@ static PyThreadState		*global_interpreter;	//!< Our first interpreter.
 
 static module_ctx_t const	*current_mctx;		//!< Used for communication with inittab functions.
 static CONF_SECTION		*current_conf;		//!< Used for communication with inittab functions.
-static char			*default_path;		//!< The default python path.
+
+static libpython_global_config_t libpython_global_config = {
+	.path = NULL,
+	.path_include_default = true
+};
+
+static CONF_PARSER const python_global_config[] = {
+	{ FR_CONF_OFFSET("path", FR_TYPE_STRING, libpython_global_config_t, path) },
+	{ FR_CONF_OFFSET("path_include_default", FR_TYPE_BOOL, libpython_global_config_t, path_include_default) },
+	CONF_PARSER_TERMINATOR
+};
+
+static int libpython_init(void);
+static void libpython_free(void);
+
+global_lib_autoinst_t rlm_python_autoinst = {
+	.name = "python",
+	.config = python_global_config,
+	.init = libpython_init,
+	.free = libpython_free,
+	.inst = &libpython_global_config
+};
+
+extern global_lib_autoinst_t const * const rlm_python_lib[];
+global_lib_autoinst_t const * const rlm_python_lib[] = {
+	&rlm_python_autoinst,
+	GLOBAL_LIB_TERMINATOR
+};
 
 /*
  *	As of Python 3.8 the GIL will be per-interpreter
@@ -128,10 +158,6 @@ static CONF_PARSER module_config[] = {
 	A(detach)
 
 #undef A
-
-	{ FR_CONF_OFFSET("python_path", FR_TYPE_STRING, rlm_python_t, python_path) },
-	{ FR_CONF_OFFSET("python_path_include_conf_dir", FR_TYPE_BOOL, rlm_python_t, python_path_include_conf_dir), .dflt = "yes" },
-	{ FR_CONF_OFFSET("python_path_include_default", FR_TYPE_BOOL, rlm_python_t, python_path_include_default), .dflt = "yes" },
 
 	CONF_PARSER_TERMINATOR
 };
@@ -800,27 +826,6 @@ static int python_module_import_constants(module_inst_ctx_t const *mctx, PyObjec
 	return 0;
 }
 
-static char *python_path_build(TALLOC_CTX *ctx, rlm_python_t *inst, CONF_SECTION *conf)
-{
-	char *path;
-
-	MEM(path = talloc_strdup(ctx, ""));
-	if (inst->python_path) {
-		MEM(path = talloc_asprintf_append_buffer(path, "%s:", inst->python_path));
-	}
-	if (inst->python_path_include_conf_dir) {
-		MEM(path = talloc_asprintf_append_buffer(path, "%s:", dirname(UNCONST(char *, cf_filename(conf)))));
-	}
-	if (inst->python_path_include_default) {
-		MEM(path = talloc_asprintf_append_buffer(path, "%s:", default_path));
-	}
-	if (path[talloc_array_length(path) - 1] == ':') {
-		MEM(path = talloc_bstr_realloc(ctx, path, talloc_array_length(path) - 2));
-	}
-
-	return path;
-}
-
 /*
  *	Python 3 interpreter initialisation and destruction
  */
@@ -851,9 +856,7 @@ static int python_interpreter_init(module_inst_ctx_t const *mctx)
 {
 	rlm_python_t	*inst = talloc_get_type_abort(mctx->inst->data, rlm_python_t);
 	CONF_SECTION	*conf = mctx->inst->conf;
-	char		*path;
 	PyObject	*module;
-	wchar_t	        *wide_path;
 
 	/*
 	 *	python_module_init takes no args, so we need
@@ -874,13 +877,6 @@ static int python_interpreter_init(module_inst_ctx_t const *mctx)
 	PyEval_SaveThread();		/* Unlock GIL */
 
 	PyEval_RestoreThread(inst->interpreter);
-
-	path = python_path_build(inst, inst, conf);
-	DEBUG3("Setting python path to \"%s\"", path);
-	wide_path = Py_DecodeLocale(path, NULL);
-	talloc_free(path);
-	PySys_SetPath(wide_path);
-	PyMem_RawFree(wide_path);
 
 	/*
 	 *	Import the radiusd module into this python
@@ -1056,7 +1052,7 @@ static int mod_thread_detach(module_thread_inst_ctx_t const *mctx)
 	return 0;
 }
 
-static int mod_load(void)
+static int libpython_init(void)
 {
 #define LOAD_INFO(_fmt, ...) fr_log(LOG_DST, L_INFO, __FILE__, __LINE__, "rlm_python - " _fmt,  ## __VA_ARGS__)
 #define LOAD_WARN(_fmt, ...) fr_log_perror(LOG_DST, L_WARN, __FILE__, __LINE__, \
@@ -1065,6 +1061,10 @@ static int mod_load(void)
 					   	.subsq_prefix = "rlm_python - ", \
 					   }, \
 					   _fmt,  ## __VA_ARGS__)
+	PyConfig	config;
+	PyStatus	status;
+	wchar_t		*wide_name;
+	char		*path;
 
 	fr_assert(!Py_IsInitialized());
 
@@ -1079,6 +1079,23 @@ static int mod_load(void)
 	python_dlhandle = dl_open_by_sym("Py_IsInitialized", RTLD_NOW | RTLD_GLOBAL);
 	if (!python_dlhandle) LOAD_WARN("Failed loading libpython symbols into global symbol table");
 
+	PyConfig_InitPythonConfig(&config);
+
+	/*
+	 *	Set program name (i.e. the software calling the interpreter)
+	 *	The value of argv[0] as a wide char string
+	 */
+	wide_name = Py_DecodeLocale(main_config->name, NULL);
+	status = PyConfig_SetString(&config, &config.program_name, wide_name);
+	PyMem_RawFree(wide_name);
+
+	if (PyStatus_Exception(status)) {
+	fail:
+		LOAD_WARN("%s", status.err_msg);
+		PyConfig_Clear(&config);
+		return -1;
+	}
+
 	/*
 	 *	Python 3 introduces the concept of a
 	 *	"inittab", i.e. a list of modules which
@@ -1086,38 +1103,50 @@ static int mod_load(void)
 	 *	interpreter is spawned.
 	 */
 	PyImport_AppendInittab("freeradius", python_module_init);
-	LSAN_DISABLE(Py_InitializeEx(0));	/* Don't override signal handlers - noop on subs calls */
 
-	/*
-	 *	Get the default search path so we can append to it.
-	 */
-	default_path = Py_EncodeLocale(Py_GetPath(), NULL);
+	if (libpython_global_config.path) {
+		wchar_t *wide_path = Py_DecodeLocale(libpython_global_config.path, NULL);
 
-	/*
-	 *	As of 3.7 this is called by Py_Initialize
-	 */
-#if PY_VERSION_HEX < 0x03070000
-	PyEval_InitThreads(); 			/* This also grabs a lock (which we then need to release) */
-#endif
-
-	/*
-	 *	Set program name (i.e. the software calling the interpreter)
-	 */
-	{
-		wchar_t *wide_name;
-		wide_name = Py_DecodeLocale(main_config->name, NULL);
-		Py_SetProgramName(wide_name);		/* The value of argv[0] as a wide char string */
-		PyMem_RawFree(wide_name);
+		if (libpython_global_config.path_include_default) {
+			/*
+			 *	The path from config is to be used in addition to the default.
+			 *	Set it in the pythonpath_env.
+			 */
+			status = PyConfig_SetString(&config, &config.pythonpath_env, wide_path);
+		} else {
+			/*
+			 *	Only the path from config is to be used.
+			 *	Setting module_search_paths_set to 1 disables any automatic paths.
+			 */
+			config.module_search_paths_set = 1;
+			status = PyWideStringList_Append(&config.module_search_paths, wide_path);
+		}
+		PyMem_RawFree(wide_path);
+		if (PyStatus_Exception(status)) goto fail;
 	}
+
+	config.install_signal_handlers = 0;	/* Don't override signal handlers - noop on subs calls */
+
+	LSAN_DISABLE(status = Py_InitializeFromConfig(&config));
+	if (PyStatus_Exception(status)) goto fail;
+
+	PyConfig_Clear(&config);
+
+	/*
+	 *	Report the path
+	 */
+	path = Py_EncodeLocale(Py_GetPath(), NULL);
+	LOAD_INFO("Python path set to \"%s\"", path);
+	PyMem_Free(path);
+
 	global_interpreter = PyEval_SaveThread();	/* Store reference to the main interpreter and release the GIL */
 
 	return 0;
 }
 
-static void mod_unload(void)
+static void libpython_free(void)
 {
 	PyThreadState_Swap(global_interpreter); /* Swap to the main thread */
-	if (default_path) PyMem_Free(default_path);
 
 	/*
 	 *	PyImport_Cleanup - Leaks memory in python 3.6
@@ -1148,8 +1177,6 @@ module_rlm_t rlm_python = {
 		.thread_inst_size	= sizeof(rlm_python_thread_t),
 
 		.config			= module_config,
-		.onload			= mod_load,
-		.unload			= mod_unload,
 
 		.instantiate		= mod_instantiate,
 		.detach			= mod_detach,

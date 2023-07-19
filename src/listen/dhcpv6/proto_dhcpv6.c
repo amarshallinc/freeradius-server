@@ -272,6 +272,15 @@ static ssize_t mod_encode(UNUSED void const *instance, request_t *request, uint8
 		fr_assert(buffer_len >= sizeof(client));
 
 		/*
+		 *	We don't accept the new client, so don't do
+		 *	anything.
+		 */
+		if (request->reply->code != FR_DHCPV6_REPLY) {
+			*buffer = true;
+			return 1;
+		}
+
+		/*
 		 *	Allocate the client.  If that fails, send back a NAK.
 		 *
 		 *	@todo - deal with NUMA zones?  Or just deal with this
@@ -430,7 +439,7 @@ static int mod_bootstrap(module_inst_ctx_t const *mctx)
 	/*
 	 *	Ensure that the server CONF_SECTION is always set.
 	 */
-	inst->io.server_cs = cf_item_to_section(cf_parent(mctx->inst->data));
+	inst->io.server_cs = cf_item_to_section(cf_parent(mctx->inst->conf));
 
 	fr_assert(dict_dhcpv6 != NULL);
 	fr_assert(attr_packet_type != NULL);

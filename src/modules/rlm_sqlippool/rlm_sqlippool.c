@@ -309,11 +309,10 @@ static int sqlippool_command(char const *fmt, rlm_sql_handle_t **handle,
 	if (xlat_aeval(request, &expanded, request, query, data->sql_inst->sql_escape_func, *handle) < 0) return -1;
 
 	ret = data->sql_inst->sql_query(data->sql_inst, request, handle, expanded);
+	talloc_free(expanded);
 	if (ret < 0){
-		talloc_free(expanded);
 		return -1;
 	}
-	talloc_free(expanded);
 
 	/*
 	 *	No handle, we can't continue.
@@ -486,7 +485,7 @@ static unlang_action_t do_logging(rlm_rcode_t *p_result, UNUSED rlm_sqlippool_t 
 	if (!str || !*str) RETURN_MODULE_RCODE(rcode);
 
 	MEM(pair_append_request(&vp, attr_module_success_message) == 0);
-	if (xlat_aeval(request, &expanded, request, str, NULL, NULL) < 0) {
+	if (xlat_aeval(vp, &expanded, request, str, NULL, NULL) < 0) {
 		pair_delete_request(vp);
 		RETURN_MODULE_RCODE(rcode);
 	}

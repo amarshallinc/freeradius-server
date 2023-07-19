@@ -57,6 +57,7 @@ typedef enum {
 #define IPPOOL_POOL_KEY			"pool"
 #define IPPOOL_ADDRESS_KEY		"ip"
 #define IPPOOL_OWNER_KEY		"device"
+#define IPPOOL_STATIC_BIT		0x10000000000000   /* A high bit which Redis ZSCORE will represent accurately*/
 
 /** {prefix}:pool
  */
@@ -65,6 +66,10 @@ typedef enum {
 /** {prefix}:ipaddr/prefix
  */
 #define IPPOOL_MAX_IP_KEY_SIZE		IPPOOL_MAX_KEY_PREFIX_SIZE + (sizeof("{}:" IPPOOL_ADDRESS_KEY ":") - 1) + INET6_ADDRSTRLEN + 4
+
+/** {prefix}:device
+ */
+#define IPPOOL_MAX_OWNER_KEY_SIZE	IPPOOL_MAX_KEY_PREFIX_SIZE + (sizeof("{}:" IPPOOL_OWNER_KEY ":") - 1) + 128
 
 
 #define IPADDR_LEN(_af) ((_af == AF_UNSPEC) ? 0 : ((_af == AF_INET6) ? 128 : 32))

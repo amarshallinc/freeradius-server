@@ -115,6 +115,7 @@ fr_kafka_topic_conf_t *kafka_topic_conf_from_cs(CONF_SECTION *cs)
 /** Perform any conversions necessary to map kafka defaults to our values
  *
  * @param[out] out	Where to write the pair.
+ * @param[in] parent	being populated.
  * @param[in] cs	to allocate the pair in.
  * @param[in] value	to convert.
  * @param[in] quote	to use when allocing the pair.
@@ -123,7 +124,7 @@ fr_kafka_topic_conf_t *kafka_topic_conf_from_cs(CONF_SECTION *cs)
  *	- 0 on success.
  *      - -1 on failure.
  */
-static int kafka_config_dflt_single(CONF_PAIR **out, CONF_SECTION *cs, char const *value,
+static int kafka_config_dflt_single(CONF_PAIR **out, UNUSED void *parent, CONF_SECTION *cs, char const *value,
 				    fr_token_t quote, CONF_PARSER const *rule)
 {
 	char				tmp[sizeof("18446744073709551615b")];
@@ -192,6 +193,7 @@ static int kafka_config_dflt_single(CONF_PAIR **out, CONF_SECTION *cs, char cons
 /** Return the default value from the kafka client library
  *
  * @param[out] out	Where to write the pair.
+ * @param[in] parent	being populated.
  * @param[in] cs	to allocate the pair in.
  * @param[in] quote	to use when allocing the pair.
  * @param[in] rule	UNUSED.
@@ -199,7 +201,7 @@ static int kafka_config_dflt_single(CONF_PAIR **out, CONF_SECTION *cs, char cons
  *	- 0 on success.
  *      - -1 on failure.
  */
-static int kafka_config_dflt(CONF_PAIR **out, CONF_SECTION *cs, fr_token_t quote, CONF_PARSER const *rule)
+static int kafka_config_dflt(CONF_PAIR **out, void *parent, CONF_SECTION *cs, fr_token_t quote, CONF_PARSER const *rule)
 {
 	char				buff[1024];
 	size_t				buff_len = sizeof(buff);
@@ -247,7 +249,7 @@ static int kafka_config_dflt(CONF_PAIR **out, CONF_SECTION *cs, fr_token_t quote
 		ue_rules.subs[(uint8_t)kctx->string_sep[0]] = kctx->string_sep[0];
 
 		while (fr_sbuff_out_unescape_until(&value_elem, &value_in, SIZE_MAX, &tt, &ue_rules) > 0) {
-			if (kafka_config_dflt_single(out, cs, fr_sbuff_start(&value_elem), quote, rule) < 0) return -1;
+			if (kafka_config_dflt_single(out, parent, cs, fr_sbuff_start(&value_elem), quote, rule) < 0) return -1;
 
 			/*
 			 *	Skip past the string separator
@@ -265,7 +267,7 @@ static int kafka_config_dflt(CONF_PAIR **out, CONF_SECTION *cs, fr_token_t quote
 	/*
 	 *	Parse a single value
 	 */
-	if (kafka_config_dflt_single(out, cs, value, quote, rule) < 0) return -1;
+	if (kafka_config_dflt_single(out, parent, cs, value, quote, rule) < 0) return -1;
 
 	return 0;
 }
@@ -273,6 +275,7 @@ static int kafka_config_dflt(CONF_PAIR **out, CONF_SECTION *cs, fr_token_t quote
 /** Return the default value for a topic from the kafka client library
  *
  * @param[out] out	Where to write the pair.
+ * @param[in] parent	being populated.
  * @param[in] cs	to allocate the pair in.
  * @param[in] quote	to use when allocing the pair.
  * @param[in] rule	UNUSED.
@@ -280,7 +283,7 @@ static int kafka_config_dflt(CONF_PAIR **out, CONF_SECTION *cs, fr_token_t quote
  *	- 0 on success.
  *      - -1 on failure.
  */
-static int kafka_topic_config_dflt(CONF_PAIR **out, CONF_SECTION *cs, fr_token_t quote, CONF_PARSER const *rule)
+static int kafka_topic_config_dflt(CONF_PAIR **out, void *parent, CONF_SECTION *cs, fr_token_t quote, CONF_PARSER const *rule)
 {
 	char				buff[1024];
 	size_t				buff_len = sizeof(buff);
@@ -313,7 +316,7 @@ static int kafka_topic_config_dflt(CONF_PAIR **out, CONF_SECTION *cs, fr_token_t
 	/*
 	 *	Parse a single value
 	 */
-	if (kafka_config_dflt_single(out, cs, value, quote, rule) < 0) return -1;
+	if (kafka_config_dflt_single(out, parent, cs, value, quote, rule) < 0) return -1;
 
 	return 0;
 }

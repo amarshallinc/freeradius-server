@@ -218,8 +218,7 @@ dnl #
 case "$target" in
   *-darwin*)
     CFLAGS="$CFLAGS -DDARWIN -mmacosx-version-min=$(sw_vers -productVersion)"
-    LDFLAGS="$LDFLAGS -L/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib -mmacosx-version-min=$(sw_vers -productVersion)"
-    LIBS="$LIBS -F /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/System/Library/Frameworks/ -framework DirectoryService"
+    LDFLAGS="$LDFLAGS -mmacosx-version-min=$(sw_vers -productVersion)"
     echo "Please be sure to use 'xcrun ./configure ...' so that the tests can find the system header files"
     ;;
 esac
@@ -1079,7 +1078,7 @@ smart_try_dir="$talloc_lib_dir"
 FR_SMART_CHECK_LIB(talloc, _talloc)
 if test "x$ac_cv_lib_talloc__talloc" != "xyes"; then
   AC_MSG_WARN([talloc library not found. Use --with-talloc-lib-dir=<path>.])
-  AC_MSG_ERROR([FreeRADIUS requires libtalloc.  Please read doc/developers/dependencies.adoc for further instructions.])
+  AC_MSG_ERROR([FreeRADIUS requires libtalloc.  Please read doc/antora/modules/installation/pages/dependencies.adoc for further instructions.])
 fi
 
 dnl #
@@ -1331,6 +1330,10 @@ if test "x$WITH_OPENSSL" = xyes; then
     OPENSSL_LIBS="$smart_lib"
     OPENSSL_LDFLAGS="$smart_ldflags"
 
+    dnl #
+    dnl #  Search first in the dir we found the crypto library
+    dnl #
+    smart_try_dir="${SMART_LD_FOUND}"
     FR_SMART_CHECK_LIB(ssl, SSL_new)
     if test "x$ac_cv_lib_ssl_SSL_new" != "xyes"; then
       AC_MSG_FAILURE([failed linking to libssl. Use --with-openssl-lib-dir=<path>, or --with-openssl=no (builds without OpenSSL)])
@@ -2642,6 +2645,20 @@ dnl #
 case "$target" in
   *-darwin*)
     echo "Please be sure to use 'xcrun gmake' or 'xcrun lldb' in order to build and run the server from the source tree"
+    dnl #
+    dnl #  OpenSSL >= 3.0 uses instruction probing to look for extensions
+    dnl #  Unfortunately Apple ARM CPUs don't support these instructions
+    dnl #  and LLDB throws an EXC_BAD_INSTRUCTION exception.
+    dnl #
+    dnl #  OpenSSL installs a SIGILL handler to catch the signal but this
+    dnl #  is also overriden by lldb.
+    dnl #
+    dnl #  To allow us to debug on macOS + LLDB + ARM we need to ignore
+    dnl #  this exception and ignore SIGILL.
+    dnl #
+    if test "x$target_cpu" = "xaarch64" -a "x$WITH_OPENSSL" = "xyes"; then
+      echo "If debugging with lldb 'echo -e \"set platform.plugin.darwin.ignored-exceptions EXC_BAD_INSTRUCTION\\\nprocess handle SIGILL -n false -p true -s false\" >> ~/.lldbinit'"
+    fi
     ;;
 
   *)

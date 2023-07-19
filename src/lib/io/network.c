@@ -114,7 +114,6 @@ struct fr_network_s {
 
 	pthread_t		thread_id;		//!< for self
 
-	bool			started;		//!< Set to true when the first worker is added.
 	bool			suspended;		//!< whether or not we're suspended.
 
 	fr_log_t const		*log;			//!< log destination
@@ -143,6 +142,8 @@ struct fr_network_s {
 
 	int			signal_pipe[2];		//!< Pipe for signalling the worker in an orderly way.
 							///< This is more deterministic than using async signals.
+
+	bool			exiting;		//!< are we exiting?
 
 	fr_network_config_t	config;			//!< configuration
 	fr_network_worker_t	*workers[MAX_WORKERS]; 	//!< each worker
@@ -347,7 +348,7 @@ void fr_network_listen_write(fr_network_t *nr, fr_listen_t *li, uint8_t const *p
 		},
 
 		.channel = {
-			.heap_id = 0,
+			.heap_id = FR_HEAP_INDEX_INVALID,
 		},
 
 		.listen = li,
@@ -500,7 +501,7 @@ static void fr_network_recv_reply(void *ctx, fr_channel_t *ch, fr_channel_data_t
 	/*
 	 *	Ensure that heap insert works.
 	 */
-	cd->channel.heap_id = 0;
+	cd->channel.heap_id = FR_HEAP_INDEX_INVALID;
 	if (fr_heap_insert(&nr->replies, cd) < 0) {
 		fr_message_done(&cd->m);
 		fr_assert(0 == 1);
@@ -762,7 +763,6 @@ int fr_network_listen_send_packet(fr_network_t *nr, fr_listen_t *parent, fr_list
 	if (!cd) return -1;
 
 	cd->listen = parent;
-	cd->request.is_dup = false;
 	cd->priority = PRIORITY_NORMAL;
 	cd->packet_ctx = packet_ctx;
 	cd->request.recv_time = recv_time;
@@ -883,7 +883,6 @@ next_message:
 		return;
 	}
 
-	cd->request.is_dup = false;
 	cd->priority = PRIORITY_NORMAL;
 
 	/*
@@ -897,7 +896,7 @@ next_message:
 	 *	connection.
 	 */
 	data_size = s->listen->app_io->read(s->listen, &cd->packet_ctx, &cd->request.recv_time,
-					    cd->m.data, cd->m.rb_size, &s->leftover, &cd->priority, &cd->request.is_dup);
+					    cd->m.data, cd->m.rb_size, &s->leftover);
 	if (data_size == 0) {
 		/*
 		 *	Cache the message for later.  This is
@@ -966,7 +965,28 @@ next_message:
 		}
 	}
 
+	/*
+	 *	Set the priority.  Which incidentally also checks if
+	 *	we're allowed to read this particular kind of packet.
+	 *
+	 *	That check is because the app_io handlers just read
+	 *	packets, and don't really have access to the parent
+	 *	"list of allowed packet types".  So we have to do the
+	 *	work here in a callback.
+	 *
+	 *	That should probably be fixed...
+	 */
+	if (s->listen->app->priority) {
+		int priority;
+
+		priority = s->listen->app->priority(s->listen->app_instance, cd->m.data, data_size);
+		if (priority <= 0) goto discard;
+
+		cd->priority = priority;
+	}
+
 	if (fr_network_send_request(nr, cd) < 0) {
+	discard:
 		talloc_free(cd->packet_ctx); /* not sure what else to do here */
 		fr_message_done(&cd->m);
 		nr->stats.dropped++;
@@ -1007,7 +1027,6 @@ int fr_network_sendto_worker(fr_network_t *nr, fr_listen_t *li, void *packet_ctx
 
 	s->stats.in++;
 
-	cd->request.is_dup = false;
 	cd->priority = PRIORITY_NORMAL;
 
 	cd->m.when = recv_time;
@@ -1357,7 +1376,7 @@ static int fr_network_listen_add_self(fr_network_t *nr, fr_listen_t *listen)
 
 	if (fr_event_fd_insert(nr, nr->el, s->listen->fd,
 			       fr_network_read,
-			       fr_network_write,
+			       s->listen->no_write_callback ? NULL : fr_network_write,
 			       fr_network_error,
 			       s) < 0) {
 		PERROR("Failed adding new socket to network event loop");
@@ -1488,8 +1507,13 @@ static void fr_network_worker_started_callback(void *ctx, void const *data, size
 	fr_channel_requestor_uctx_add(w->channel, w);
 	fr_channel_set_recv_reply(w->channel, nr, fr_network_recv_reply);
 
+	/*
+	 *	FIXME: This creates a race in the network loop
+	 *	exit condition, because it can theoretically
+	 *	be signalled to exit before the workers have
+	 *	ACKd channel creation.
+	 */
 	nr->num_workers++;
-	nr->started = true;
 
 	/*
 	 *	Insert the worker into the array of workers.
@@ -1714,6 +1738,7 @@ int fr_network_destroy(fr_network_t *nr)
 
 	(void) fr_event_pre_delete(nr->el, fr_network_pre_event, nr);
 	(void) fr_event_post_delete(nr->el, fr_network_post_event, nr);
+	nr->exiting = true;
 	fr_event_fd_delete(nr->el, nr->signal_pipe[0], FR_EVENT_FILTER_IO);
 
 	return 0;
@@ -1754,7 +1779,20 @@ static void _signal_pipe_read(UNUSED fr_event_list_t *el, int fd, UNUSED int fla
  */
 void fr_network(fr_network_t *nr)
 {
-	while (likely(((nr->num_workers > 0) || !nr->started))) {
+	/*
+	 *	Run until we're told to exit AND the number of
+	 *	workers has dropped to zero.
+	 *
+	 *	This is important as if we exit too early we
+	 *	free the channels out from underneath the
+	 *	workers and they read uninitialised memory.
+	 *
+	 *	Whenever a worker ACKs our close notification
+	 *	nr->num_workers is decremented, so when
+	 *	nr->num_workers == 0, all workers have ACKd
+	 *	our close and are no longer using the channel.
+	 */
+	while (likely(!(nr->exiting && (nr->num_workers == 0)))) {
 		bool wait_for_event;
 		int num_events;
 
@@ -1782,6 +1820,7 @@ void fr_network(fr_network_t *nr)
 			fr_event_service(nr->el);
 		}
 	}
+	return;
 }
 
 /** Signal a network thread to exit

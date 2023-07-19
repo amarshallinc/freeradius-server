@@ -49,6 +49,8 @@ RCSIDH(dhcpv6_h, "$Id$")
 
 #define DHCPV6_MAX_RELAY_NESTING	10
 
+#define DHCPV6_MAX_ATTRIBUTES		1024
+
 /*
  *	Defined addresses from RFC 8415 Section 7.1
  */
@@ -140,6 +142,7 @@ typedef struct {
 	uint32_t		transaction_id;		//!< previous transaction ID
 	uint8_t			*duid;			//!< the expected DUID, in wire format
 	size_t			duid_len;		//!< length of the expected DUID
+	bool			struct_nested;		//!< decode structs as nested
 } fr_dhcpv6_decode_ctx_t;
 
 /*

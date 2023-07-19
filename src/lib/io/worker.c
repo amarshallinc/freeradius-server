@@ -76,6 +76,16 @@ static alignas(CACHE_LINE_SIZE) atomic_uint64_t request_number = 0;
 
 static _Thread_local fr_ring_buffer_t *fr_worker_rb;
 
+typedef struct {
+	fr_channel_t		*ch;
+
+	/*
+	 *	To save time, we don't care about num_elements here.  Which means that we don't
+	 *	need to cache or lookup the fr_worker_listen_t when we free a request.
+	 */
+	fr_dlist_head_t		dlist;
+} fr_worker_channel_t;
+
 /**
  *  A worker which takes packets from a master, and processes them.
  */
@@ -121,7 +131,7 @@ struct fr_worker_s {
 
 	fr_event_timer_t const	*ev_cleanup;	//!< timer for max_request_time
 
-	fr_channel_t		**channel;	//!< list of channels
+	fr_worker_channel_t	*channel;	//!< list of channels
 };
 
 typedef struct {
@@ -202,6 +212,15 @@ static void worker_recv_request(void *ctx, fr_channel_t *ch, fr_channel_data_t *
 	worker_request_bootstrap(worker, cd, fr_time());
 }
 
+static void worker_requests_cancel(fr_worker_channel_t *ch)
+{
+	request_t *request;
+
+	while ((request = fr_dlist_pop_head(&ch->dlist)) != NULL) {
+		unlang_interpret_signal(request, FR_SIGNAL_CANCEL);
+	}
+}
+
 static void worker_exit(fr_worker_t *worker)
 {
 	worker->exiting = true;
@@ -271,11 +290,13 @@ static void worker_channel_callback(void *ctx, void const *data, size_t data_siz
 
 		ok = false;
 		for (i = 0; i < worker->config.max_channels; i++) {
-			fr_assert(worker->channel[i] != ch);
+			fr_assert(worker->channel[i].ch != ch);
 
-			if (worker->channel[i] != NULL) continue;
+			if (worker->channel[i].ch != NULL) continue;
 
-			worker->channel[i] = ch;
+			worker->channel[i].ch = ch;
+			fr_dlist_init(&worker->channel[i].dlist, fr_async_t, entry);
+
 			DEBUG3("Received channel %p into array entry %d", ch, i);
 
 			ms = fr_message_set_create(worker, worker->config.message_set_size,
@@ -302,19 +323,27 @@ static void worker_channel_callback(void *ctx, void const *data, size_t data_siz
 		 *	of channels.
 		 */
 		for (i = 0; i < worker->config.max_channels; i++) {
-			if (!worker->channel[i]) continue;
+			if (!worker->channel[i].ch) continue;
 
-			if (worker->channel[i] != ch) continue;
+			if (worker->channel[i].ch != ch) continue;
+
+			worker_requests_cancel(&worker->channel[i]);
 
 			ms = fr_channel_responder_uctx_get(ch);
+
+			fr_assert_msg(fr_dlist_num_elements(&worker->channel[i].dlist) == 0,
+				      "Network added messages to channel after sending FR_CHANNEL_CLOSE");
 
 			fr_channel_responder_ack_close(ch);
 			fr_assert(ms != NULL);
 			fr_message_set_gc(ms);
 			talloc_free(ms);
 
-			worker->channel[i] = NULL;
+			worker->channel[i].ch = NULL;
+
+			fr_assert(!fr_dlist_head(&worker->channel[i].dlist)); /* we can't look at num_elements */
 			fr_assert(worker->num_channels > 0);
+
 			worker->num_channels--;
 			ok = true;
 			break;
@@ -641,10 +670,7 @@ static void worker_send_reply(fr_worker_t *worker, request_t *request, bool send
 		ssize_t slen = 0;
 		fr_listen_t const *listen = request->async->listen;
 
-		if (worker->config.flatten_before_encode) {
-			fr_pair_flatten(request->pair_list.reply);
-
-		} else if (worker->config.unflatten_before_encode) {
+		if (worker->config.unflatten_before_encode) {
 			fr_pair_unflatten(request->pair_list.reply);
 		} /* else noop */
 
@@ -714,7 +740,6 @@ static void worker_send_reply(fr_worker_t *worker, request_t *request, bool send
 
 #ifndef NDEBUG
 	request->async->el = NULL;
-	request->async->process = NULL;
 	request->async->channel = NULL;
 	request->async->packet_ctx = NULL;
 	request->async->listen = NULL;
@@ -761,6 +786,7 @@ void worker_request_init(fr_worker_t *worker, request_t *request, fr_time_t now)
 	request->async = talloc_zero(request, fr_async_t);
 	request->async->recv_time = now;
 	request->async->el = worker->el;
+	fr_dlist_entry_init(&request->async->entry);
 }
 
 static inline CC_HINT(always_inline)
@@ -773,7 +799,6 @@ void worker_request_name_number(request_t *request)
 
 static void worker_request_bootstrap(fr_worker_t *worker, fr_channel_data_t *cd, fr_time_t now)
 {
-	bool			is_dup;
 	int			ret = -1;
 	request_t		*request;
 	TALLOC_CTX		*ctx;
@@ -845,7 +870,6 @@ nak:
 	/*
 	 *	We're done with this message.
 	 */
-	is_dup = cd->request.is_dup;
 	fr_message_done(&cd->m);
 
 	/*
@@ -857,16 +881,6 @@ nak:
 
 		old = fr_rb_find(worker->dedup, request);
 		if (!old) {
-			/*
-			 *	Ignore duplicate packets where we've
-			 *	already sent the reply.
-			 */
-			if (is_dup) {
-				RDEBUG("Got duplicate packet notice after we had sent a reply - ignoring");
-				fr_channel_null_reply(request->async->channel);
-				talloc_free(request);
-				return;
-			}
 			goto insert_new;
 		}
 
@@ -1033,9 +1047,14 @@ void fr_worker_destroy(fr_worker_t *worker)
 	 *	automatically freed when our talloc context is freed.
 	 */
 	for (i = 0; i < worker->config.max_channels; i++) {
-		if (!worker->channel[i]) continue;
+		if (!worker->channel[i].ch) continue;
 
-		fr_channel_responder_ack_close(worker->channel[i]);
+		worker_requests_cancel(&worker->channel[i]);
+
+		fr_assert_msg(fr_dlist_num_elements(&worker->channel[i].dlist) == 0,
+			      "Pending messages in channel after cancelling request");
+
+		fr_channel_responder_ack_close(worker->channel[i].ch);
 	}
 
 	talloc_free(worker);
@@ -1107,6 +1126,13 @@ static void _worker_request_done_external(request_t *request, UNUSED rlm_rcode_t
 	worker_request_time_tracking_end(worker, request, now);
 
 	/*
+	 *	Remove it from the list of requests associated with this channel.
+	 */
+	if (fr_dlist_entry_in_list(&request->async->entry)) {
+		fr_dlist_entry_unlink(&request->async->entry);
+	}
+
+	/*
 	 *	These conditions are true when the server is
 	 *	exiting and we're stopping all the requests.
 	 *
@@ -1134,6 +1160,7 @@ static void _worker_request_done_internal(request_t *request, UNUSED rlm_rcode_t
 
 	fr_assert(!fr_heap_entry_inserted(request->runnable_id));
 	fr_assert(!fr_minmax_heap_entry_inserted(request->time_order_id));
+	fr_assert(!fr_dlist_entry_in_list(&request->async->entry));
 }
 
 /** Detached request (i.e. one generated by the interpreter with no parent) is now complete
@@ -1160,6 +1187,8 @@ static void _worker_request_done_detached(request_t *request, UNUSED rlm_rcode_t
 	 */
 	(void)fr_minmax_heap_extract(worker->time_order, request);
 
+	fr_assert(!fr_dlist_entry_in_list(&request->async->entry));
+
 	/*
 	 *	Detached requests have to be freed by us
 	 *	as nothing else can free them.
@@ -1174,9 +1203,9 @@ static void _worker_request_done_detached(request_t *request, UNUSED rlm_rcode_t
 /** Make us responsible for running the request
  *
  */
-static void _worker_request_detach(request_t *request, void *uctx)
+static void _worker_request_detach(request_t *request, UNUSED void *uctx)
 {
-	fr_worker_t	*worker = talloc_get_type_abort(uctx, fr_worker_t);
+//	fr_worker_t	*worker = talloc_get_type_abort(uctx, fr_worker_t);
 
 	RDEBUG3("Request is detached");
 	fr_assert(request_is_detached(request));
@@ -1186,7 +1215,7 @@ static void _worker_request_detach(request_t *request, void *uctx)
 	 *	because they don't contribute for the time consumed by an
 	 *	external request.
 	 */
-	worker_request_time_tracking_end(worker, request, fr_time());
+//	worker_request_time_tracking_end(worker, request, fr_time());
 
 	return;
 }
@@ -1351,7 +1380,7 @@ nomem:
 	CHECK_CONFIG(ring_buffer_size, (1 << 17), (1 << 20));
 	CHECK_CONFIG_TIME_DELTA(max_request_time, fr_time_delta_from_sec(5), fr_time_delta_from_sec(120));
 
-	worker->channel = talloc_zero_array(worker, fr_channel_t *, worker->config.max_channels);
+	worker->channel = talloc_zero_array(worker, fr_worker_channel_t, worker->config.max_channels);
 	if (!worker->channel) {
 		talloc_free(worker);
 		goto nomem;
@@ -1444,7 +1473,11 @@ nomem:
 }
 
 
-/** The main loop and entry point of the worker thread.
+/** The main loop and entry point of the stand-alone worker thread.
+ *
+ *  Where there is only one thread, the event loop runs fr_worker_pre_event() and fr_worker_post_event()
+ *  instead, And then fr_worker_post_event() takes care of calling worker_run_request() to actually run the
+ *  request.
  *
  * @param[in] worker the worker data structure to manage
  */
@@ -1452,7 +1485,7 @@ void fr_worker(fr_worker_t *worker)
 {
 	WORKER_VERIFY;
 
-	while (!worker->exiting) {
+	while (true) {
 		bool wait_for_event;
 		int num_events;
 
@@ -1464,6 +1497,8 @@ void fr_worker(fr_worker_t *worker)
 		 */
 		wait_for_event = (fr_heap_num_elements(worker->runnable) == 0);
 		if (wait_for_event) {
+			if (worker->exiting && (fr_minmax_heap_num_elements(worker->time_order) == 0)) break;
+
 			DEBUG4("Ready to process requests");
 		}
 
@@ -1627,9 +1662,9 @@ static void worker_verify(fr_worker_t *worker)
 	(void) talloc_get_type_abort(worker->dedup, fr_rb_tree_t);
 
 	for (i = 0; i < worker->config.max_channels; i++) {
-		if (!worker->channel[i]) continue;
+		if (!worker->channel[i].ch) continue;
 
-		(void) talloc_get_type_abort(worker->channel[i], fr_channel_t);
+		(void) talloc_get_type_abort(worker->channel[i].ch, fr_channel_t);
 	}
 }
 #endif

@@ -612,7 +612,6 @@ SSL_CTX *fr_tls_ctx_alloc(fr_tls_conf_t const *conf, bool client)
 	SSL_CTX		*ctx;
 	X509_STORE	*cert_vpstore;
 	X509_STORE	*verify_store;
-	int		verify_mode = SSL_VERIFY_NONE;
 	int		ctx_options = 0;
 
 	ctx = SSL_CTX_new(TLS_method());
@@ -797,6 +796,8 @@ SSL_CTX *fr_tls_ctx_alloc(fr_tls_conf_t const *conf, bool client)
 		 *	those are set above with SSL_CTX_load_verify_locations.
 		 */
 		if (conf->ca_file) SSL_CTX_set_client_CA_list(ctx, SSL_load_client_CA_file(conf->ca_file));
+	} else {
+		X509_STORE_set_default_paths(verify_store);
 	}
 
 	/*
@@ -943,12 +944,6 @@ post_ca:
 #endif
 
 
-	/*
-	 *	set the message callback to identify the type of
-	 *	message.  For every new session, there can be a
-	 *	different callback argument.
-	 */
-	SSL_CTX_set_msg_callback(ctx, fr_tls_session_msg_cb);
 	/* Set Info callback */
 	SSL_CTX_set_info_callback(ctx, fr_tls_session_info_cb);
 
@@ -977,14 +972,11 @@ post_ca:
 #endif
 
 	/*
-	 *	Set verify modes
-	 *	Always verify the peer certificate
+	 *	SSL_ctx_set_verify is now called in the session
+	 *	alloc functions so they can set custom behaviour
+	 *	depending on the code area the SSL * will be used
+	 *	and whether we're acting as a client or server.
 	 */
-	verify_mode |= SSL_VERIFY_PEER;
-	verify_mode |= SSL_VERIFY_FAIL_IF_NO_PEER_CERT;
-	verify_mode |= SSL_VERIFY_CLIENT_ONCE;
-	SSL_CTX_set_verify(ctx, verify_mode, fr_tls_verify_cert_cb);
-
 	if (conf->verify_depth) {
 		SSL_CTX_set_verify_depth(ctx, conf->verify_depth);
 	}

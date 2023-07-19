@@ -29,6 +29,8 @@ RCSID("$Id$")
 #include <freeradius-devel/server/cond.h>
 #include <freeradius-devel/server/modpriv.h>
 #include <freeradius-devel/server/request_data.h>
+#include <freeradius-devel/server/rcode.h>
+#include <freeradius-devel/unlang/call_env.h>
 
 #include "module_priv.h"
 #include "subrequest_priv.h"
@@ -487,6 +489,7 @@ unlang_action_t unlang_module_yield_to_xlat(TALLOC_CTX *ctx, bool *p_success, fr
  *				types of xlats.
  * @param[in] resume		function to call when the XLAT expansion is complete.
  * @param[in] signal		function to call if a signal is received.
+ * @param[in] sigmask		Signals to block.
  * @param[in] rctx		to pass to the resume() and signal() callbacks.
  * @return
  *	- UNLANG_ACTION_PUSHED_CHILD
@@ -874,57 +877,6 @@ static void unlang_module_event_retry_handler(UNUSED fr_event_list_t *el, fr_tim
 	frame->signal(request, frame, FR_SIGNAL_TIMEOUT);
 }
 
-/** Parse the result of module_env tmpl expansion
- */
-static inline CC_HINT(always_inline) int module_env_value_parse(request_t *request, void *out, void **tmpl_out,
-								unlang_frame_state_module_t *state) {
-	fr_value_box_t			*vb;
-	module_env_parsed_t const	*env = state->last_expanded;
-
-	vb = fr_value_box_list_head(&state->tmpl_expanded);
-
-	if (!vb) {
-		if (!env->rule->pair.nullable) {
-			RPEDEBUG("Failed to evaluate required module option %s", env->rule->name);
-			return -1;
-		}
-		return 0;
-	}
-
-	/*
-	 *	Concatenate multiple boxes if needed
-	 */
-	if (env->rule->pair.concat &&
-	    fr_value_box_list_concat_in_place(vb, vb, &state->tmpl_expanded, FR_BASE_TYPE(env->rule->type),
-					      FR_VALUE_BOX_LIST_FREE, true, SIZE_MAX) < 0 ) {
-		RPEDEBUG("Failed concatenating values for %s", env->rule->name);
-		return -1;
-	}
-
-	if (env->rule->pair.single && (fr_value_box_list_num_elements(&state->tmpl_expanded) > 1)) {
-		RPEDEBUG("%d values found for %s.  Only one is allowed",
-			 fr_value_box_list_num_elements(&state->tmpl_expanded), env->rule->name);
-		return -1;
-	}
-
-	while ((vb = fr_value_box_list_pop_head(&state->tmpl_expanded))) {
-		switch (env->rule->pair.type) {
-		case MOD_ENV_TYPE_VALUE_BOX:
-			fr_value_box_copy_shallow(state->env_data, (fr_value_box_t *)(out), vb);
-			break;
-
-		case MOD_ENV_TYPE_VALUE_BOX_LIST:
-			if (!fr_value_box_list_initialised((fr_value_box_list_t *)out)) fr_value_box_list_init((fr_value_box_list_t *)out);
-			fr_value_box_list_insert_tail((fr_value_box_list_t *)out, vb);
-			break;
-		}
-	}
-
-	if (tmpl_out) *tmpl_out = env->tmpl;
-
-	return 0;
-}
-
 static unlang_action_t unlang_module(rlm_rcode_t *p_result, request_t *request, unlang_stack_frame_t *frame)
 {
 	unlang_module_t			*mc;
@@ -961,94 +913,27 @@ static unlang_action_t unlang_module(rlm_rcode_t *p_result, request_t *request, 
 	}
 
 	if (mc->method_env) {
-		void				*out, **array, *tmpl_out = NULL;
-		module_env_parsed_t const	*env;
-		TALLOC_CTX			*ctx;
-
-		switch (state->env_state) {
-		/*
-		 *	We have a method env and this is the first call.
-		 *	Allocate the data structure.
-		 */
-		case MOD_ENV_EXP_INIT:
-			MEM(state->env_data = talloc_zero_array(state, uint8_t, mc->method_env->inst_size));
-			talloc_set_name_const(state->env_data, mc->method_env->inst_type);
-			fr_value_box_list_init(&state->tmpl_expanded);
-			state->env_state = MOD_ENV_EXP_PROC;
-			break;
-
-		/*
-		 *	Processing of module env is underway, parse the
-		 *	value returned but the last expansion.
-		 */
-		case MOD_ENV_EXP_PROC:
-		{
-			env = state->last_expanded;
-
-			/*
-			 *	Find the location of the output
-			 */
-			out = ((uint8_t *)state->env_data) + env->rule->offset;
-
-			/*
-			 *	If this is a multi pair option, the output is an array.
-			 *	Find the correct offset in the array.
-			 */
-			if (env->rule->pair.multi) {
-				array = *(void **)out;
-				out = ((uint8_t *)array) + env->rule->pair.size * env->multi_index;
-			}
-
-			if (env->rule->pair.tmpl_offset) tmpl_out = ((uint8_t *)state->env_data) + env->rule->pair.tmpl_offset;
-
-			if (module_env_value_parse(request, out, tmpl_out, state) < 0) {
-				ua = UNLANG_ACTION_FAIL;
+		if (!state->env_data) {
+			ua = call_env_expand(state, request, &state->env_result, &state->env_data, mc->method_env, &mc->call_env_parsed);
+			switch (ua) {
+			case UNLANG_ACTION_FAIL:
 				goto fail;
-			}
-		}
-			break;
 
-		case MOD_ENV_EXP_DONE:
-			goto expansion_done;
+			case UNLANG_ACTION_PUSHED_CHILD:
+				frame_repeat(frame, unlang_module);
+				return UNLANG_ACTION_PUSHED_CHILD;
+
+			default:
+				break;
+			}
 		}
 
 		/*
-		 *	Look for the next tmpl to expand
+		 *	Fail the module call on callenv failure
 		 */
-		state->last_expanded = mod_env_parsed_next(&mc->mod_env_parsed, state->last_expanded);
-		if (!state->last_expanded) {
-			state->env_state = MOD_ENV_EXP_DONE;
-			goto expansion_done;
-		}
-		env = state->last_expanded;
-		ctx = state->env_data;
-
-		/*
-		 *	Multi pair options should allocate boxes in the context of the array
-		 */
-		if (env->rule->pair.multi) {
-			out = ((uint8_t *)state->env_data) + env->rule->offset;
-
-			/*
-			 *	For multi pair options, allocate the array before expanding the first entry.
-			 */
-			if (env->multi_index == 0) {
-				MEM(array = _talloc_zero_array(state->env_data, env->rule->pair.size,
-							       env->opt_count, env->rule->pair.type_name));
-				*(void **)out = array;
-			}
-			ctx = *(void **)out;
-		}
-
-		frame_repeat(frame, unlang_module);
-		if (unlang_tmpl_push(ctx, &state->tmpl_expanded, request, state->last_expanded->tmpl, NULL) < 0) {
-			ua = UNLANG_ACTION_FAIL;
-			goto fail;
-		}
-		return UNLANG_ACTION_PUSHED_CHILD;
+		if (state->env_result != CALL_ENV_SUCCESS) RETURN_MODULE_FAIL;
 	}
 
-expansion_done:
 	/*
 	 *	Grab the thread/module specific data if any exists.
 	 */

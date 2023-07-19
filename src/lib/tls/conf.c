@@ -44,6 +44,8 @@ USES_APPLE_DEPRECATED_API	/* OpenSSL API has been deprecated by Apple */
 #include "base.h"
 #include "log.h"
 
+static int tls_conf_parse_cache_mode(TALLOC_CTX *ctx, void *out, void *parent, CONF_ITEM *ci, CONF_PARSER const *rule);
+
 /** Certificate formats
  *
  */
@@ -80,7 +82,7 @@ static size_t verify_mode_table_len = NUM_ELEMENTS(verify_mode_table);
 
 static CONF_PARSER tls_cache_config[] = {
 	{ FR_CONF_OFFSET("mode", FR_TYPE_UINT32, fr_tls_cache_conf_t, mode),
-			 .func = cf_table_parse_int,
+			 .func = tls_conf_parse_cache_mode,
 			 .uctx = &(cf_table_parse_ctx_t){
 			 	.table = cache_mode_table,
 			 	.len = &cache_mode_table_len
@@ -204,7 +206,7 @@ CONF_PARSER fr_tls_server_config[] = {
 };
 
 CONF_PARSER fr_tls_client_config[] = {
-	{ FR_CONF_OFFSET("chain", FR_TYPE_SUBSECTION | FR_TYPE_MULTI, fr_tls_conf_t, chains),
+	{ FR_CONF_OFFSET("chain", FR_TYPE_SUBSECTION | FR_TYPE_MULTI | FR_TYPE_OK_MISSING, fr_tls_conf_t, chains),
 	  .subcs_size = sizeof(fr_tls_chain_conf_t), .subcs_type = "fr_tls_chain_conf_t",
 	  .subcs = tls_chain_config },
 
@@ -237,6 +239,109 @@ CONF_PARSER fr_tls_client_config[] = {
 	{ FR_CONF_DEPRECATED("check_cert_cn", FR_TYPE_STRING, fr_tls_conf_t, check_cert_cn) },
 	CONF_PARSER_TERMINATOR
 };
+
+static int tls_conf_parse_cache_mode(TALLOC_CTX *ctx, void *out, void *parent, CONF_ITEM *ci, CONF_PARSER const *rule)
+{
+	fr_tls_conf_t	*conf = talloc_get_type_abort((uint8_t *)parent - offsetof(fr_tls_conf_t, cache), fr_tls_conf_t);
+	int		cache_mode;
+
+	if (cf_table_parse_int(ctx, &cache_mode, parent, ci, rule) < 0) return -1;
+
+	/*
+	 *	Ensure our virtual server contains the
+	 *      correct sections for the specified
+	 *      cache mode.
+	 */
+	switch (cache_mode) {
+	case FR_TLS_CACHE_DISABLED:
+	case FR_TLS_CACHE_STATELESS:
+		break;
+
+	case FR_TLS_CACHE_STATEFUL:
+		if (!conf->virtual_server) {
+			cf_log_err(ci, "A virtual_server must be set when cache.mode = \"stateful\"");
+		error:
+			return -1;
+		}
+
+		if (!cf_section_find(conf->virtual_server, "load", "session")) {
+			cf_log_err(ci, "Specified virtual_server must contain a \"load session { ... }\" section "
+				   "when cache.mode = \"stateful\"");
+			goto error;
+		}
+
+		if (!cf_section_find(conf->virtual_server, "store", "session")) {
+			cf_log_err(ci, "Specified virtual_server must contain a \"store session { ... }\" section "
+				   "when cache.mode = \"stateful\"");
+			goto error;
+		}
+
+		if (!cf_section_find(conf->virtual_server, "clear", "session")) {
+			cf_log_err(ci, "Specified virtual_server must contain a \"clear session { ... }\" section "
+			           "when cache.mode = \"stateful\"");
+			goto error;
+		}
+
+		if (conf->tls_min_version >= (float)1.3) {
+			cf_log_err(ci, "cache.mode = \"stateful\" is not supported with tls_min_version >= 1.3");
+			goto error;
+		}
+		break;
+
+	case FR_TLS_CACHE_AUTO:
+		if (!conf->virtual_server) {
+			WARN("A virtual_server must be provided for stateful caching. "
+			     "cache.mode = \"auto\" rewritten to cache.mode = \"stateless\"");
+		cache_stateless:
+			conf->cache.mode = FR_TLS_CACHE_STATELESS;
+			break;
+		}
+
+		if (!cf_section_find(conf->virtual_server, "load", "session")) {
+			cf_log_warn(ci, "Specified virtual_server missing \"load session { ... }\" section. "
+			            "cache.mode = \"auto\" rewritten to cache.mode = \"stateless\"");
+			goto cache_stateless;
+		}
+
+		if (!cf_section_find(conf->virtual_server, "store", "session")) {
+			cf_log_warn(ci, "Specified virtual_server missing \"store session { ... }\" section. "
+			            "cache.mode = \"auto\" rewritten to cache.mode = \"stateless\"");
+			goto cache_stateless;
+		}
+
+		if (!cf_section_find(conf->virtual_server, "clear", "session")) {
+			cf_log_warn(ci, "Specified virtual_server missing \"clear cache { ... }\" section. "
+				    "cache.mode = \"auto\" rewritten to cache.mode = \"stateless\"");
+			goto cache_stateless;
+		}
+
+		if (conf->tls_min_version >= (float)1.3) {
+			cf_log_err(ci, "stateful session-resumption is not supported with tls_min_version >= 1.3. "
+			           "cache.mode = \"auto\" rewritten to cache.mode = \"stateless\"");
+			goto error;
+		}
+		break;
+	}
+
+	/*
+	 *	Generate random, ephemeral, session-ticket keys.
+	 */
+	if (cache_mode & FR_TLS_CACHE_STATELESS) {
+		/*
+		 *	Fill the key with randomness if one
+		 *	wasn't specified by the user.
+		 */
+		if (!conf->cache.session_ticket_key) {
+			MEM(conf->cache.session_ticket_key = talloc_array(conf, uint8_t, 256));
+			fr_rand_buffer(UNCONST(uint8_t *, conf->cache.session_ticket_key),
+				       talloc_array_length(conf->cache.session_ticket_key));
+		}
+	}
+
+	*((int *)out) = cache_mode;
+
+	return 0;
+}
 
 #ifdef __APPLE__
 /*
@@ -378,7 +483,9 @@ fr_tls_conf_t *fr_tls_conf_parse_server(CONF_SECTION *cs)
 
 	if ((cf_section_parse(conf, conf, cs) < 0) ||
 	    (cf_section_parse_pass2(conf, cs) < 0)) {
+#ifdef __APPLE__
 	error:
+#endif
 		talloc_free(conf);
 		return NULL;
 	}
@@ -393,96 +500,6 @@ fr_tls_conf_t *fr_tls_conf_parse_server(CONF_SECTION *cs)
 #ifdef __APPLE__
 	if (conf_cert_admin_password(conf) < 0) goto error;
 #endif
-
-	/*
-	 *	Ensure our virtual server contains the
-	 *      correct sections for the specified
-	 *      cache mode.
-	 */
-	switch (conf->cache.mode) {
-	case FR_TLS_CACHE_DISABLED:
-	case FR_TLS_CACHE_STATELESS:
-		break;
-
-	case FR_TLS_CACHE_STATEFUL:
-		if (!conf->virtual_server) {
-			ERROR("A virtual_server must be set when cache.mode = \"stateful\"");
-			goto error;
-		}
-
-		if (!cf_section_find(conf->virtual_server, "load", "session")) {
-			ERROR("Specified virtual_server must contain a \"load session { ... }\" section "
-			      "when cache.mode = \"stateful\"");
-			goto error;
-		}
-
-		if (!cf_section_find(conf->virtual_server, "store", "session")) {
-			ERROR("Specified virtual_server must contain a \"store session { ... }\" section "
-			      "when cache.mode = \"stateful\"");
-			goto error;
-		}
-
-		if (!cf_section_find(conf->virtual_server, "clear", "session")) {
-			ERROR("Specified virtual_server must contain a \"clear session { ... }\" section "
-			      "when cache.mode = \"stateful\"");
-			goto error;
-		}
-
-		if (conf->tls_min_version >= (float)1.3) {
-			ERROR("cache.mode = \"stateful\" is not supported with tls_min_version >= 1.3");
-			goto error;
-		}
-		break;
-
-	case FR_TLS_CACHE_AUTO:
-		if (!conf->virtual_server) {
-			WARN("A virtual_server must be provided for stateful caching. "
-			     "cache.mode = \"auto\" rewritten to cache.mode = \"stateless\"");
-		cache_stateless:
-			conf->cache.mode = FR_TLS_CACHE_STATELESS;
-			break;
-		}
-
-		if (!cf_section_find(conf->virtual_server, "load", "session")) {
-			WARN("Specified virtual_server missing \"load session { ... }\" section. "
-			     "cache.mode = \"auto\" rewritten to cache.mode = \"stateless\"");
-			goto cache_stateless;
-		}
-
-		if (!cf_section_find(conf->virtual_server, "store", "session")) {
-			WARN("Specified virtual_server missing \"store session { ... }\" section. "
-			     "cache.mode = \"auto\" rewritten to cache.mode = \"stateless\"");
-			goto cache_stateless;
-		}
-
-		if (!cf_section_find(conf->virtual_server, "clear", "session")) {
-			WARN("Specified virtual_server missing \"clear cache { ... }\" section. "
-			     "cache.mode = \"auto\" rewritten to cache.mode = \"stateless\"");
-			goto cache_stateless;
-		}
-
-		if (conf->tls_min_version >= (float)1.3) {
-			ERROR("stateful session-resumption is not supported with tls_min_version >= 1.3. "
-			      "cache.mode = \"auto\" rewritten to cache.mode = \"stateless\"");
-			goto error;
-		}
-		break;
-	}
-
-	/*
-	 *	Generate random, ephemeral, session-ticket keys.
-	 */
-	if (conf->cache.mode & FR_TLS_CACHE_STATELESS) {
-		/*
-		 *	Fill the key with randomness if one
-		 *	wasn't specified by the user.
-		 */
-		if (!conf->cache.session_ticket_key) {
-			MEM(conf->cache.session_ticket_key = talloc_array(conf, uint8_t, 256));
-			fr_rand_buffer(UNCONST(uint8_t *, conf->cache.session_ticket_key),
-				       talloc_array_length(conf->cache.session_ticket_key));
-		}
-	}
 
 	/*
 	 *	Cache conf in cs in case we're asked to parse this again.

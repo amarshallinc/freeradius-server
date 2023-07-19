@@ -148,7 +148,7 @@ void xlat_debug_attr_vp(request_t *request, fr_pair_t *vp, tmpl_t const *vpt)
 	fr_table_num_ordered_t const	*type;
 	size_t				i;
 
-	switch (vp->da->type) {
+	switch (vp->vp_type) {
 	case FR_TYPE_STRUCTURAL:
 		if (vpt) {
 			RIDEBUG2("&%s.%s = {",
@@ -191,7 +191,7 @@ void xlat_debug_attr_vp(request_t *request, fr_pair_t *vp, tmpl_t const *vpt)
 	if (vendor) RIDEBUG2("vendor     : %i (%s)", vendor->pen, vendor->name);
 	RIDEBUG3("type       : %s", fr_type_to_str(vp->vp_type));
 
-	switch (vp->da->type) {
+	switch (vp->vp_type) {
 	case FR_TYPE_LEAF:
 		if (fr_box_is_variable_size(&vp->data)) {
 			RIDEBUG3("length     : %zu", vp->vp_length);
@@ -353,7 +353,7 @@ static xlat_action_t xlat_func_flatten(UNUSED TALLOC_CTX *ctx, UNUSED fr_dcursor
 	}
 
 	if ((tmpl_find_vp(&vp, request, vpt) < 0) ||
-	    (vp->da->type != FR_TYPE_GROUP)) {
+	    (vp->vp_type != FR_TYPE_GROUP)) {
 		REDEBUG("Can't find '%s', or it's not a group", fmt);
 		talloc_free(vpt);
 		return XLAT_ACTION_FAIL;
@@ -402,7 +402,7 @@ static xlat_action_t xlat_func_unflatten(UNUSED TALLOC_CTX *ctx, UNUSED fr_dcurs
 	}
 
 	if ((tmpl_find_vp(&vp, request, vpt) < 0) ||
-	    (vp->da->type != FR_TYPE_GROUP)) {
+	    (vp->vp_type != FR_TYPE_GROUP)) {
 		REDEBUG("Can't find '%s', or it's not a group", fmt);
 		talloc_free(vpt);
 		return XLAT_ACTION_FAIL;
@@ -616,13 +616,13 @@ static xlat_action_t xlat_func_integer(TALLOC_CTX *ctx, fr_dcursor_t *out,
 		}
 
 		if (in_vb->vb_length > sizeof(uint32_t)) {
-			fr_value_box_cast_in_place(ctx, in_vb, FR_TYPE_UINT64, NULL);
+			if (unlikely(fr_value_box_cast_in_place(ctx, in_vb, FR_TYPE_UINT64, NULL) < 0)) goto error;
 		} else if (in_vb->vb_length > sizeof(uint16_t)) {
-			fr_value_box_cast_in_place(ctx, in_vb, FR_TYPE_UINT32, NULL);
+			if (unlikely(fr_value_box_cast_in_place(ctx, in_vb, FR_TYPE_UINT32, NULL) < 0)) goto error;
 		} else if (in_vb->vb_length > sizeof(uint8_t)) {
-			fr_value_box_cast_in_place(ctx, in_vb, FR_TYPE_UINT16, NULL);
+			if (unlikely(fr_value_box_cast_in_place(ctx, in_vb, FR_TYPE_UINT16, NULL) < 0)) goto error;
 		} else {
-			fr_value_box_cast_in_place(ctx, in_vb, FR_TYPE_UINT8, NULL);
+			if (unlikely(fr_value_box_cast_in_place(ctx, in_vb, FR_TYPE_UINT8, NULL) < 0)) goto error;
 		}
 
 		break;
@@ -1374,7 +1374,7 @@ finish:
 
 static xlat_arg_parser_t const xlat_func_cast_args[] = {
 	{ .required = true, .single = true, .type = FR_TYPE_VOID },
-	{ .required = true, .type = FR_TYPE_VOID },
+	{ .type = FR_TYPE_VOID },
 	{ .variadic = XLAT_ARG_VARIADIC_EMPTY_KEEP, .type = FR_TYPE_VOID },
 	XLAT_ARG_PARSER_TERMINATOR
 };
@@ -1425,6 +1425,25 @@ static xlat_action_t xlat_func_cast(TALLOC_CTX *ctx, fr_dcursor_t *out,
 		}
 	}
 
+	(void) fr_value_box_list_pop_head(args);
+
+	/*
+	 *	When we cast nothing to a string / octets, the result is an empty string/octets.
+	 */
+	if (unlikely(!fr_value_box_list_head(args))) {
+		if ((type == FR_TYPE_STRING) || (type == FR_TYPE_OCTETS)) {
+			fr_value_box_t *dst;
+
+			MEM(dst = fr_value_box_alloc(ctx, type, NULL, false));
+			fr_dcursor_append(out, dst);
+
+			return XLAT_ACTION_DONE;
+		}
+
+		RDEBUG("No data for cast to '%s'", fr_type_to_str(type));
+		return XLAT_ACTION_FAIL;
+	}
+
 	/*
 	 *	Cast to string means *print* to string.
 	 */
@@ -1432,14 +1451,13 @@ static xlat_action_t xlat_func_cast(TALLOC_CTX *ctx, fr_dcursor_t *out,
 		fr_sbuff_t *agg;
 		fr_value_box_t *dst;
 
-		(void) fr_value_box_list_pop_head(args);
 		talloc_free(name);
 
-		FR_SBUFF_TALLOC_THREAD_LOCAL(&agg, 256, 8192);
+		FR_SBUFF_TALLOC_THREAD_LOCAL(&agg, 256, SIZE_MAX);
 
 		MEM(dst = fr_value_box_alloc_null(ctx));
-		if (fr_value_box_list_concat_as_string(NULL, agg, args, NULL, 0, &fr_value_escape_double,
-						       FR_VALUE_BOX_LIST_FREE_BOX, true, true) < 0) {
+		if (fr_value_box_list_concat_as_string(NULL, agg, args, NULL, 0, NULL,
+						       FR_VALUE_BOX_LIST_FREE_BOX, true) < 0) {
 			RPEDEBUG("Failed concatenating string");
 			return XLAT_ACTION_FAIL;
 		}
@@ -1453,7 +1471,7 @@ static xlat_action_t xlat_func_cast(TALLOC_CTX *ctx, fr_dcursor_t *out,
 	/*
 	 *	Copy inputs to outputs, casting them along the way.
 	 */
-	arg = name;
+	arg = NULL;
 	while ((arg = fr_value_box_list_next(args, arg)) != NULL) {
 		fr_value_box_t	*vb, *p;
 
@@ -3191,6 +3209,9 @@ static int xlat_protocol_register(fr_dict_t const *dict)
 	if (tp_decode) {
 		snprintf(buffer, sizeof(buffer), "%s.decode", name);
 
+		/* May be called multiple times, so just skip protocols we've already registered */
+		if (xlat_func_find(buffer, -1)) return 1;
+
 		if (unlikely((xlat = xlat_func_register(NULL, buffer, protocol_decode_xlat, FR_TYPE_UINT32)) == NULL)) return -1;
 		xlat_func_args_set(xlat, protocol_decode_xlat_args);
 		/* coverity[suspicious_sizeof] */
@@ -3206,6 +3227,8 @@ static int xlat_protocol_register(fr_dict_t const *dict)
 	if (tp_encode) {
 		snprintf(buffer, sizeof(buffer), "%s.encode", name);
 
+		if (xlat_func_find(buffer, -1)) return 1;
+
 		if (unlikely((xlat = xlat_func_register(NULL, buffer, protocol_encode_xlat, FR_TYPE_OCTETS)) == NULL)) return -1;
 		xlat_func_args_set(xlat, protocol_encode_xlat_args);
 		/* coverity[suspicious_sizeof] */
@@ -3216,7 +3239,9 @@ static int xlat_protocol_register(fr_dict_t const *dict)
 	return 0;
 }
 
-static int xlat_protocol_init(void)
+/** Register xlats for any loaded dictionaries
+ */
+int xlat_protocols_register(void)
 {
 	fr_dict_t *dict;
 	fr_dict_global_ctx_iter_t iter;
@@ -3261,11 +3286,6 @@ int xlat_init(void)
 	 *	Registers async xlat operations in the `unlang` interpreter.
 	 */
 	unlang_xlat_init();
-
-	/*
-	 *	Define encode/decode xlats for the various protocols.
-	 */
-	if (xlat_protocol_init() < 0) return -1;
 
 	/*
 	 *	These are all "pure" functions.

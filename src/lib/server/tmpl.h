@@ -403,11 +403,13 @@ FR_DLIST_TYPES(tmpl_attr_list)
 typedef enum {
 	TMPL_ATTR_FILTER_TYPE_NONE = 0,			//!< No filter present.
 	TMPL_ATTR_FILTER_TYPE_INDEX,			//!< Filter is an index type.
+	TMPL_ATTR_FILTER_TYPE_CONDITION,       		//!< Filter is a condition
 } tmpl_attr_filter_type_t;
 
 typedef struct {
 	tmpl_attr_filter_type_t	_CONST type;		//!< Type of filter this is.
 	int16_t			_CONST num;		//!< For array references.
+	xlat_exp_head_t		_CONST *cond;		//!< xlat condition
 } tmpl_attr_filter_t;
 
 /** An element in a list of nested attribute references
@@ -524,10 +526,12 @@ static inline bool ar_is_raw(tmpl_attr_t const *ar)
 }
 
 #define ar_num				filter.num
+#define ar_cond				filter.cond
 #define ar_filter_type			filter.type
 
 #define ar_filter_is_none(_ar)		((_ar)->ar_filter_type == TMPL_ATTR_FILTER_TYPE_NONE)
 #define ar_filter_is_num(_ar)		((_ar)->ar_filter_type == TMPL_ATTR_FILTER_TYPE_INDEX)
+#define ar_filter_is_cond(_ar)		((_ar)->ar_filter_type == TMPL_ATTR_FILTER_TYPE_CONDITION)
 /** @} */
 
 /** A source or sink of value data.
@@ -1028,6 +1032,7 @@ typedef enum {
 							///< to the one specified.
 	TMPL_ATTR_ERROR_FILTER_NOT_ALLOWED,		//!< Filters disallowed by rules.
 	TMPL_ATTR_ERROR_INVALID_ARRAY_INDEX,		//!< Invalid array index.
+	TMPL_ATTR_ERROR_INVALID_FILTER,			//!< Invalid filter
 	TMPL_ATTR_ERROR_NESTING_TOO_DEEP,		//!< Too many levels of nesting.
 	TMPL_ATTR_ERROR_MISSING_TERMINATOR,		//!< Unexpected text found after attribute reference
 	TMPL_ATTR_ERROR_BAD_CAST			//!< Specified cast was invalid.
@@ -1326,7 +1331,7 @@ int			tmpl_eval_pair(TALLOC_CTX *ctx, fr_value_box_list_t *out, request_t *reque
 
 int			tmpl_eval(TALLOC_CTX *ctx, fr_value_box_list_t *out, request_t *request, tmpl_t const *vpt);
 
-int			tmpl_eval_cast(TALLOC_CTX *ctx, fr_value_box_list_t *out, tmpl_t const *vpt);
+int			tmpl_eval_cast_in_place(fr_value_box_list_t *out, tmpl_t const *vpt);
 /** @} */
 
 ssize_t			tmpl_preparse(char const **out, size_t *outlen, char const *in, size_t inlen,
@@ -1339,6 +1344,8 @@ bool			tmpl_async_required(tmpl_t const *vpt) CC_HINT(nonnull);
 int			tmpl_value_list_insert_tail(fr_value_box_list_t *list, fr_value_box_t *vb, tmpl_t const *vpt) CC_HINT(nonnull);
 
 void			tmpl_rules_child_init(TALLOC_CTX *ctx, tmpl_rules_t *out, tmpl_rules_t const *parent, tmpl_t *vpt) CC_HINT(nonnull);
+
+void			tmpl_rules_debug(tmpl_rules_t const *rules) CC_HINT(nonnull);
 
 int			tmpl_global_init(void);
 void			tmpl_global_free(void);

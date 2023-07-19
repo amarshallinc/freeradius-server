@@ -61,7 +61,11 @@ static void test_init(void)
 	autofree = talloc_autofree_context();
 	if (!autofree) {
 	error:
+#ifdef TEST_NESTED_PAIRS
+		fr_perror("pair_nested_tests");
+#else
 		fr_perror("pair_tests");
+#endif
 		fr_exit_now(EXIT_FAILURE);
 	}
 
@@ -75,7 +79,11 @@ static void test_init(void)
 	/* Initialize the "test_pairs" list */
 	fr_pair_list_init(&test_pairs);
 
+#ifdef TEST_NESTED_PAIRS
+	if (fr_pair_test_list_alloc_nested(autofree, &test_pairs, NULL) < 0) goto error;
+#else
 	if (fr_pair_test_list_alloc(autofree, &test_pairs, NULL) < 0) goto error;
+#endif
 }
 
 /*
@@ -117,6 +125,35 @@ static void test_fr_pair_afrom_child_num(void)
 	TEST_MSG("Expected attr(%d) == vp->da->attr(%d)", attr, vp->da->attr);
 
 	talloc_free(vp);
+}
+
+static void test_fr_pair_afrom_da_nested(void)
+{
+	fr_pair_t    *vp, *parent = NULL;
+	fr_pair_list_t	local_pairs;
+
+	fr_pair_list_init(&local_pairs);
+
+	TEST_CASE("Allocation using fr_pair_afrom_da_nested");
+	TEST_CHECK((vp = fr_pair_afrom_da_nested(autofree, &local_pairs, fr_dict_attr_test_tlv_string)) != NULL);
+
+	TEST_CHECK(vp && vp->da == fr_dict_attr_test_tlv_string);
+	TEST_MSG("Expected attr(%s) == vp->da->attr(%s)", fr_dict_attr_test_tlv_string->name, vp->da->name);
+
+	TEST_CASE("Validating PAIR_VERIFY()");
+	PAIR_VERIFY(vp);
+
+	TEST_CASE("Top list does not have the tlv child attribute");
+	TEST_CHECK(fr_pair_find_by_da(&local_pairs, NULL, fr_dict_attr_test_tlv_string) == NULL);
+
+	TEST_CASE("Top list does have the tlv attribute");
+	parent = fr_pair_find_by_da(&local_pairs, NULL, fr_dict_attr_test_tlv);
+	TEST_ASSERT(parent != NULL);
+
+	TEST_CASE("Parent list does have the tlv child attribute");
+	TEST_CHECK(fr_pair_find_by_da(&parent->vp_group, NULL, fr_dict_attr_test_tlv_string) == vp);
+
+	talloc_free(parent);	/* not vp! */
 }
 
 static void test_fr_pair_copy(void)
@@ -289,14 +326,14 @@ static void test_fr_pair_find_by_da_idx(void)
 {
 	fr_pair_t *vp;
 
-	TEST_CASE("Search for fr_dict_attr_test_tlv_string using fr_pair_find_by_da_idx()");
-	TEST_CHECK((vp = fr_pair_find_by_da(&test_pairs, NULL, fr_dict_attr_test_tlv_string)) != NULL);
+	TEST_CASE("Search for fr_dict_attr_test_string using fr_pair_find_by_da_idx()");
+	TEST_CHECK((vp = fr_pair_find_by_da_idx(&test_pairs, fr_dict_attr_test_string, 0)) != NULL);
 
 	TEST_CASE("Validating PAIR_VERIFY()");
 	PAIR_VERIFY(vp);
 
-	TEST_CASE("Expected (vp->da == fr_dict_attr_test_tlv_string)");
-	TEST_CHECK(vp && vp->da == fr_dict_attr_test_tlv_string);
+	TEST_CASE("Expected (vp->da == fr_dict_attr_test_string)");
+	TEST_CHECK(vp && vp->da == fr_dict_attr_test_string);
 }
 
 static void test_fr_pair_find_by_child_num_idx(void)
@@ -523,22 +560,27 @@ static void test_fr_pair_prepend_by_da(void)
 	fr_pair_list_free(&local_pairs);
 }
 
-static void test_fr_pair_update_by_da(void)
+static void test_fr_pair_update_by_da_parent(void)
 {
-	fr_pair_t *vp;
+	fr_pair_t *vp, *group;
+
+	TEST_CHECK((group = fr_pair_afrom_da(autofree, fr_dict_attr_test_group)) != NULL);
+	if (!group) return; /* quiet clang scan */
 
 	TEST_CASE("Update Add using fr_pair_prepend_by_da()");
-	TEST_CHECK(fr_pair_update_by_da(autofree, &vp, &test_pairs, fr_dict_attr_test_uint32, 0) == 1); /* attribute already exist */
+	TEST_CHECK(fr_pair_update_by_da_parent(group, &vp, fr_dict_attr_test_uint32) == 0); /* attribute doesn't exist in this group */
 	vp->vp_uint32 = 54321;
 
 	TEST_CASE("Expected fr_dict_attr_test_uint32 (vp->vp_uint32 == 54321)");
-	TEST_CHECK((vp = fr_pair_find_by_da(&test_pairs, NULL, fr_dict_attr_test_uint32)) != NULL);
+	TEST_CHECK((vp = fr_pair_find_by_da(&group->vp_group, NULL, fr_dict_attr_test_uint32)) != NULL);
 
 	TEST_CASE("Validating PAIR_VERIFY()");
 	PAIR_VERIFY(vp);
 
 	TEST_CASE("Expected (vp == 54321)");
 	TEST_CHECK(vp && vp->vp_uint32 == 54321);
+
+	talloc_free(group);
 }
 
 static void test_fr_pair_delete_by_da(void)
@@ -656,35 +698,37 @@ static void test_fr_pair_list_copy_by_da(void)
 
 static void test_fr_pair_list_copy_by_ancestor(void)
 {
-	fr_dcursor_t   cursor;
-	fr_pair_t      *vp, *needle = NULL;
+	fr_pair_t      *vp;
 	fr_pair_list_t	local_pairs;
 
 	fr_pair_list_init(&local_pairs);
 
 	TEST_CASE("Copy 'test_pairs' into 'local_pairs'");
-	TEST_CHECK(fr_pair_list_copy_by_ancestor(autofree, &local_pairs, &test_pairs, fr_dict_attr_test_tlv, 0) > 0);
+	TEST_CHECK(fr_pair_list_copy_by_ancestor(autofree, &local_pairs, &test_pairs, fr_dict_attr_test_tlv) > 0);
+
+	TEST_CASE("The 'local_pairs' should have only one attribute in it");
+	TEST_CHECK(fr_pair_list_num_elements(&local_pairs) == 1);
 
 	TEST_CASE("The 'local_pairs' should have only fr_dict_attr_test_tlv_string (ancestor of 'Test-TLV-Root'");
-	for (vp = fr_pair_dcursor_init(&cursor, &local_pairs);
-	     vp;
-	     vp = fr_dcursor_next(&cursor)) {
-		TEST_CASE("Validating PAIR_VERIFY()");
-		PAIR_VERIFY(vp);
+	vp = fr_pair_list_head(&local_pairs);
 
-		if (vp->da == fr_dict_attr_test_tlv_string) {
-			needle = vp;
-			break;
-		}
-	}
+	TEST_CASE("Validating we copied the attribute");
+	TEST_CHECK(vp != NULL);
+	if (!vp) return;
 
-	TEST_CASE("Validating PAIR_VERIFY()");
+#ifdef TEST_NESTED_PAIRS
+	TEST_CASE("Expected copied attribute == fr_dict_attr_test_tlv)");
+	TEST_CHECK(vp->da == fr_dict_attr_test_tlv);
+#else
+	TEST_CASE("Expected copied attribute == fr_dict_attr_test_tlv_string)");
+	TEST_CHECK(vp->da == fr_dict_attr_test_tlv_string);
+#endif
 
-	TEST_CHECK(needle != NULL);
-	if (needle) PAIR_VERIFY(needle);
+	TEST_CASE("Verifying the copied attribute");	
+	PAIR_VERIFY(vp);
 
-	TEST_CASE("Expected (needle->da == fr_dict_attr_test_tlv_string)");
-	TEST_CHECK(needle && needle->da == fr_dict_attr_test_tlv_string);
+	TEST_CASE("Expecting nothing else in local list");
+	TEST_CHECK(fr_pair_list_next(&local_pairs, vp) == NULL);
 
 	fr_pair_list_free(&local_pairs);
 }
@@ -1341,6 +1385,7 @@ TEST_LIST = {
 	 */
 	{ "fr_pair_afrom_da",                     test_fr_pair_afrom_da },
 	{ "fr_pair_afrom_child_num",              test_fr_pair_afrom_child_num },
+	{ "fr_pair_afrom_da_nested",              test_fr_pair_afrom_da_nested },
 	{ "fr_pair_copy",                         test_fr_pair_copy },
 	{ "fr_pair_steal",                        test_fr_pair_steal },
 
@@ -1356,7 +1401,7 @@ TEST_LIST = {
 	{ "fr_pair_prepend_by_da",                test_fr_pair_prepend_by_da },
 	{ "fr_pair_append_by_da_parent",          test_fr_pair_append_by_da_parent },
 	{ "fr_pair_delete_by_child_num",          test_fr_pair_delete_by_child_num },
-	{ "fr_pair_update_by_da",                 test_fr_pair_update_by_da },
+	{ "fr_pair_update_by_da_parent",          test_fr_pair_update_by_da_parent },
 	{ "fr_pair_delete",                       test_fr_pair_delete },
 	{ "fr_pair_delete_by_da",                 test_fr_pair_delete_by_da },
 

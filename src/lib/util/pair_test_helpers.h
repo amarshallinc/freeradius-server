@@ -51,7 +51,25 @@ static inline int fr_pair_test_list_alloc(TALLOC_CTX *ctx, fr_pair_list_t *out,
 
 	for (p = test_defs;
 	     p->attr != -1;
-	     p++) if (fr_pair_prepend_by_da(ctx, NULL, out, *p->da) < 0) return -1;
+	     p++) if (!fr_type_is_structural((*p->da)->type) && fr_pair_prepend_by_da(ctx, NULL, out, *p->da) < 0) return -1;
+
+	PAIR_LIST_VERIFY(out);
+
+	return 0;
+}
+
+static inline int fr_pair_test_list_alloc_nested(TALLOC_CTX *ctx, fr_pair_list_t *out,
+					  	fr_dict_test_attr_t const *test_defs)
+{
+	fr_dict_test_attr_t const *p;
+
+	if (!test_defs) test_defs = fr_dict_test_attrs;
+
+	fr_pair_list_init(out);
+
+	for (p = test_defs;
+	     p->attr != -1;
+	     p++) if (fr_pair_append_by_da_parent(ctx, NULL, out, *p->da) < 0) return -1;
 
 	PAIR_LIST_VERIFY(out);
 
